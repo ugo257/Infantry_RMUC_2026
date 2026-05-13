@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Cortex Debug (J-Link, STM32F407)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/Debug/Infantry_RMUC_2026.elf",
+      "servertype": "jlink",
+      "serverpath": "JLinkGDBServerCL",
+      "gdbPath": "${workspaceFolder}/tools/debug/arm-gdb-wrapper.sh",
+      "device": "STM32F407IG",
+      "interface": "swd",
+      "runToEntryPoint": "main",
+      "rtos": "FreeRTOS",
+      "showDevDebugOutput": "none",
+      "detachOnDisconnect": true
+    },
+    {
+      "name": "Cortex Debug (OpenOCD, CMSIS-DAP, STM32F407)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/Debug/Infantry_RMUC_2026.elf",
+      "servertype": "openocd",
+      "serverpath": "${workspaceFolder}/tools/debug/openocd-wrapper.sh",
+      "configFiles": [
+        "${workspaceFolder}/.vscode/openocd-cmsis-dap-stm32f407.cfg"
+      ],
+      "searchDir": [
+        "${workspaceFolder}/.tools/openocd/current/openocd/scripts"
+      ],
+      "gdbPath": "${workspaceFolder}/tools/debug/arm-gdb-wrapper.sh",
+      "device": "STM32F407IG",
+      "interface": "swd",
+      "runToEntryPoint": "main",
+      "rtos": "FreeRTOS",
+      "liveWatch": {
+        "enabled": true,
+        "samplesPerSecond": 10
+      },
+      "showDevDebugOutput": "parsed",
+      "detachOnDisconnect": true
+    }
+  ]
+}

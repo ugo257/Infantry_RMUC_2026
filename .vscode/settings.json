@@ -1,0 +1,8 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.defaultConfigurePreset": "Debug",
+  "cmake.defaultBuildPreset": "Debug",
+  "cmake.configureOnOpen": true,
+  "cortex-debug.liveWatchRefreshRate": 100,
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+}

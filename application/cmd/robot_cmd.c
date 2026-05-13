@@ -1,0 +1,1321 @@
+﻿// app
+#include "math.h"
+#include "robot_board.h"
+#include "robot_params.h"
+#include "robot_types.h"
+#include "robot_cmd.h"
+#include "omni_UI.h"
+// module
+#include "QuaternionEKF.h"
+#include "remote_control.h"
+#include "ins_task.h"
+#include "master_process.h"
+#include "message_center.h"
+#include "general_def.h"
+#include "dji_motor.h"
+#include "referee_UI.h"
+#include "referee_init.h"
+#include "tool.h"
+#include "super_cap.h"
+#include "rs485_cmd.h"
+#include "tick_timer.h"
+#include "AHRS_middleware.h"
+#include "rm_referee.h"
+#include "crc_ref.h"
+// bsp
+#include "bsp_dwt.h"
+#include "bsp_log.h"
+#include "vofa.h"
+//看门狗
+#include "iwdg.h"
+// 图传协议中C档的值为0，因此丢控不能再靠开关字段是否为0判断。
+#define RC_LOST (!RemoteControlIsOnline())
+
+// 私有宏,自动将编码器转换成角度值
+#define YAW_ALIGN_ANGLE (YAW_CHASSIS_ALIGN_ECD * ECD_ANGLE_COEF_DJI) // 对齐时的角度,0-360
+#if PITCH_FEED_TYPE                                                  // Pitch电机反馈数据源为陀螺仪
+#define PTICH_HORIZON_ANGLE 0                                        // PITCH水平时电机的角度
+#if PITCH_ECD_UP_ADD
+#define PITCH_LIMIT_ANGLE_UP   (((PITCH_POS_UP_LIMIT_ECD > PITCH_HORIZON_ECD) ? (PITCH_POS_UP_LIMIT_ECD - PITCH_HORIZON_ECD) : (PITCH_POS_UP_LIMIT_ECD + 8192 - PITCH_HORIZON_ECD)) * ECD_ANGLE_COEF_DJI)       // 云台竖直方向最大角度 0-360
+#define PITCH_LIMIT_ANGLE_DOWN (((PITCH_POS_DOWN_LIMIT_ECD < PITCH_HORIZON_ECD) ? (PITCH_POS_DOWN_LIMIT_ECD - PITCH_HORIZON_ECD) : (PITCH_POS_DOWN_LIMIT_ECD - 8192 - PITCH_HORIZON_ECD)) * ECD_ANGLE_COEF_DJI) // 云台竖直方向最小角度 0-360
+#else
+#define PITCH_LIMIT_ANGLE_UP   (((PITCH_POS_UP_LIMIT_ECD < PITCH_HORIZON_ECD) ? (PITCH_POS_UP_LIMIT_ECD - PITCH_HORIZON_ECD) : (PITCH_POS_UP_LIMIT_ECD - 8192 - PITCH_HORIZON_ECD)) * ECD_ANGLE_COEF_DJI)       // 云台竖直方向最大角度 0-360
+#define PITCH_LIMIT_ANGLE_DOWN (((PITCH_POS_DOWN_LIMIT_ECD > PITCH_HORIZON_ECD) ? (PITCH_POS_DOWN_LIMIT_ECD - PITCH_HORIZON_ECD) : (PITCH_POS_DOWN_LIMIT_ECD + 8192 - PITCH_HORIZON_ECD)) * ECD_ANGLE_COEF_DJI) // 云台竖直方向最小角度 0-360
+#endif
+#else           // PITCH电机反馈数据源为编码器
+
+#define PTICH_HORIZON_ANGLE    (PITCH_HORIZON_ECD * ECD_ANGLE_COEF_DJI) // PITCH水平时电机的角度,0-360
+#define PITCH_LIMIT_ANGLE_UP   (PITCH_POS_MAX_ECD * ECD_ANGLE_COEF_DJI) // 云台竖直方向最大角度 0-360
+#define PITCH_LIMIT_ANGLE_DOWN (PITCH_POS_MIN_ECD * ECD_ANGLE_COEF_DJI) // 云台竖直方向最小角度 0-360
+#endif
+//发给邓浩宇的云台数据
+static float yaw_reverse,vision_pitch_gyro_rad_s,vision_pitch_rad,vision_roll_gyro_rad_s;
+//接收宇哥的数据
+typedef struct {
+    uint32_t online_frame_cnt;
+    uint32_t len_fail_cnt;
+    uint32_t head_fail_cnt;
+    uint32_t crc_ok_cnt;
+    uint32_t crc_fail_cnt;
+    uint8_t last_mode;
+    float yaw;
+    float yaw_vel;
+    float yaw_acc;
+    float pitch;
+    float pitch_vel;
+    float pitch_acc;
+} VisionRxDebug_s;
+
+volatile VisionRxDebug_s g_vision_rx_debug;
+/* cmd应用包含的模块实例指针和交互信息存储*/
+#ifdef CHASSIS_BOARD
+static Publisher_t *chassis_cmd_pub;   // 底盘控制消息发布者
+static Subscriber_t *chassis_feed_sub; // 底盘反馈信息订阅者
+static Chassis_Upload_Data_s chassis_fetch_data; // 从底盘应用接收的反馈信息信息,底盘功率枪口热量与底盘运动状态等
+#endif
+static Chassis_Ctrl_Cmd_s chassis_cmd_send;      // 发送给底盘应用的信息,包括控制信息和UI绘制相关
+static Chassis_Ctrl_Cmd_s_uart chassis_cmd_send_uart;
+static Chassis_Upload_Data_s_uart chassis_fetch_data_uart;
+Chassis_Ctrl_Cmd_s_uart chassis_rs485_recv;
+extern referee_info_t *referee_data_for_ui;
+static RC_ctrl_t *rc_data; // 遥控器数据,初始化时返回
+HostInstance *host_instance; // 上位机接口
+RS485Instance *rs485_master_instance; // 接口
+RS485Instance *rs485_slaver_instance; // RS485从机接口
+#ifdef GIMBAL_BOARD
+static RobotCMD485TxState_s ctrl_tx_state;
+#endif
+#ifdef CHASSIS_BOARD
+static RobotCMD485TxState_s upload_tx_state;
+#endif
+extern INS_Instance *INS;
+// 这里的四元数以wxyz的顺序
+uint8_t vision_send_data[43]; // 给视觉上位机发送的数据
+uint8_t fifo_pack[NUC_RECV_SIZE]; // NUC接收缓冲区
+static Publisher_t *gimbal_cmd_pub  ;            // 云台控制消息发布者
+static Subscriber_t *gimbal_feed_sub;          // 云台反馈信息订阅者
+static Gimbal_Ctrl_Cmd_s gimbal_cmd_send;      // 传递给云台的控制信息
+static Gimbal_Upload_Data_s gimbal_fetch_data; // 从云台获取的反馈信息
+
+static Publisher_t *shoot_cmd_pub;           // 发射控制消息发布者
+static Subscriber_t *shoot_feed_sub;         // 发射反馈信息订阅者
+static Shoot_Ctrl_Cmd_s shoot_cmd_send;      // 传递给发射的控制信息
+static Shoot_Upload_Data_s shoot_fetch_data; // 从发射获取的反馈信息
+#ifdef CHASSIS_BOARD
+static Publisher_t *ui_cmd_pub;        // UI控制消息发布者
+static Subscriber_t *ui_feed_sub;      // UI反馈信息订阅者
+static UI_Cmd_s ui_cmd_send;           // 传递给UI的控制信息
+#endif
+
+static Robot_Status_e robot_state; // 机器人整体工作状态
+static referee_info_t *referee_data; // 用于获取裁判系统的数据
+uint8_t UI_SendFlag = 1; // UI发送标志位
+#define MECANUM_FORCE_UI_FLAG_BIT 0x80u
+#define UI_SEND_FLAG_MASK         0x7Fu
+extern uint16_t g_power_set ; // 功率设置
+uint8_t auto_rune; // 自瞄打符标志位
+volatile gimbal_mode_e gimbal_last_mode=GIMBAL_ZERO_FORCE;
+float fire_advice;
+float vision_yaw_vel = 0; // 视觉提供的yaw速度前馈
+// #define Chassis_Ctrl_Cmd_s_uart_size sizeof(Chassis_Ctrl_Cmd_s_uart)
+// #define Chassis_Upload_Data_s_uart_size sizeof(Chassis_Upload_Data_s_uart)
+uint8_t SuperCap_flag_from_user = 0; // 超电标志位
+volatile uint8_t rc_update_flag = 0;//遥控器数据更新标志位（防止同一个周期多次触发）
+static uint8_t mecanum_force_ctrl_enable = 0u; // 麦轮力控独立开关（与 chassis_mode 解耦）
+// 图传遥控离散按键是瞬时状态，这两个变量保存上升沿触发后的锁存开关状态。
+static uint8_t remote_nuc_toggle_enable = 0u;
+static uint8_t remote_rotate_enable = 0u;
+#ifdef GIMBAL_BOARD
+static uint8_t robot_cmd_hole_restore_active = 0u;
+static gimbal_mode_e robot_cmd_last_gimbal_mode = GIMBAL_ZERO_FORCE;
+static void RobotCMDVisionRxDecode(HostInstance *instance, const uint8_t *buf, uint16_t len);
+#endif
+
+void RobotCMDSetMecanumForceCtrl(uint8_t enable)
+{
+    mecanum_force_ctrl_enable = (enable != 0u) ? 1u : 0u;
+}
+
+uint8_t RobotCMDGetMecanumForceCtrl(void)
+{
+    return mecanum_force_ctrl_enable;
+}
+// float imu_angle[3];
+// float imu_gyro[3];
+static PIDInstance PITCH_version_PID = {
+    .Kp            = 0.005,   // 25,//25, // 50,//70, // 4.5
+    .Ki            = 0,    // 0
+    .Kd            = 0.008, // 0.0,  // 0.07,  // 0
+    .DeadBand      = 0.3,  // 0.75,  //跟随模式设置了死区，防止抖动
+    .IntegralLimit = 30,
+    .Improve       = PID_OutputFilter|PID_Derivative_On_Measurement|PID_Integral_Limit|PID_Trapezoid_Intergral/*PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement*/,
+    .MaxOut        = 0.04,
+    .Output_LPF_RC=0.95,
+};
+static PIDInstance YAW_version_PID = {
+    .Kp            = 0.0037,//0.02,//0.033,   // 25,//25, // 50,//70, // 4.5
+    .Ki            = 0,    // 0
+    .Kd            = 0.00055,//0.001,//0.003, // 0.0,  // 0.07,  // 0
+    .DeadBand      = 0.75,  // 0.75,  //跟随模式设置了死区，防止抖动
+    .IntegralLimit = 3000,
+    .Improve       = PID_Trapezoid_Intergral | PID_Integral_Limit | PID_Derivative_On_Measurement|PID_OutputFilter,
+    .MaxOut        = 0.1,//0.05,//0.045,
+    .Output_LPF_RC=0.7,
+};
+//欧拉角到四元数转换
+void EularAngleToQuaternion(float Y, float P, float R, float *q)
+{
+    float cosPitch, cosYaw, cosRoll, sinPitch, sinYaw, sinRoll;
+    // Y /= 57.295779513f;
+    // P /= 57.295779513f;
+    // R /= 57.295779513f;
+    cosPitch = arm_cos_f32(P / 2);
+    cosYaw   = arm_cos_f32(Y / 2);
+    cosRoll  = arm_cos_f32(R / 2);
+    sinPitch = arm_sin_f32(P / 2);
+    sinYaw   = arm_sin_f32(Y / 2);
+    sinRoll  = arm_sin_f32(R / 2);
+q[0] = cosYaw * cosPitch * cosRoll + sinYaw * sinPitch * sinRoll;
+q[1] = cosYaw * cosPitch * sinRoll - sinYaw * sinPitch * cosRoll;
+q[2] = cosYaw * sinPitch * cosRoll + sinYaw * cosPitch * sinRoll;
+q[3] = sinYaw * cosPitch * cosRoll - cosYaw * sinPitch * sinRoll;
+}
+
+// 将 float 拆分为 4 个 uint8_t 字节（手动处理高低位）
+void float_to_uint8_manual(float value, uint8_t *bytes) {
+    uint32_t as_int;
+    memcpy(&as_int, &value, sizeof(float)); // 将 float 转换为 uint32_t
+
+    *bytes = (uint8_t)(as_int & 0xFF);         // 第 1 个字节（低位）
+    *(bytes+1) = (uint8_t)((as_int >> 8) & 0xFF);  // 第 2 个字节
+    *(bytes+2) = (uint8_t)((as_int >> 16) & 0xFF); // 第 3 个字节
+    *(bytes+3) = (uint8_t)((as_int >> 24) & 0xFF); // 第 4 个字节（高位）
+}
+
+// 将 4 个 uint8_t 字节解析回 float（手动处理高低位）
+float uint8_to_float_manual(uint8_t *bytes) {
+    uint32_t as_int = 0;
+
+    as_int |= ((uint32_t)bytes[0]);
+    as_int |= ((uint32_t)bytes[1] << 8);
+    as_int |= ((uint32_t)bytes[2] << 16);
+    as_int |= ((uint32_t)bytes[3] << 24);
+
+    float value;
+    memcpy(&value, &as_int, sizeof(float)); // 将 uint32_t 转换回 float
+    return value;
+}
+
+// 新增字段只改对应方向表的一行：字段名、第一帧头、周期tick。
+// 第二帧头按表中顺序自动从0x01递增。
+// period_ticks: 1=1000Hz, 2=500Hz, 10=100Hz, 20=50Hz, 50=20Hz。
+static const RobotCMD485Signal_s robot_cmd_ctrl_signals[] = {
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, reset_flag,         0xA1u, 10u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, vx,                 0xA1u, 10u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, vy,                 0xA1u, 10u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, wz,                 0xA1u, 10u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, yaw_control,        0xA1u, 10u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, yaw_gyro,           0xA1u, 1u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, yaw_angle,          0xA1u, 1u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, nuc_yaw,            0xA1u, 0u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, shoot_count,        0xA1u, 1u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, gimbal_mode,        0xA1u, 13u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, chassis_mode,       0xA1u, 13u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, shoot_mode,         0xA1u, 13u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, load_mode,          0xA1u, 13u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, friction_mode,      0xA1u, 13u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, nuc_mode,           0xA1u, 13u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, superCap_flag,      0xA1u, 13u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, vision_yaw,         0xA1u, 7u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, vision_yaw_vel,     0xA1u, 7u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Ctrl_Cmd_s_uart, vision_yaw_acc,     0xA1u, 7u),
+};
+
+// 控制分项信号表项数量；每个表项对应一种控制单项帧，帧长由payload类型决定。
+#define ROBOT_CMD_CTRL_SIGNAL_COUNT ((uint8_t)(sizeof(robot_cmd_ctrl_signals) / sizeof(robot_cmd_ctrl_signals[0])))
+
+static const RobotCMD485Signal_s robot_cmd_upload_signals[] = {
+    ROBOT_CMD_485_SIGNAL(Chassis_Upload_Data_s_uart, chassis_pitch_angle,          0xB1u, 1u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Upload_Data_s_uart, initial_speed,                0xB1u, 10u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Upload_Data_s_uart, color,                        0xB1u, 50u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Upload_Data_s_uart, hole_yaw_ready,               0xB1u, 10u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Upload_Data_s_uart, chassis_yaw_gyro,             0xB1u, 1u),
+    ROBOT_CMD_485_SIGNAL(Chassis_Upload_Data_s_uart, yaw_motor_vel,                0xB1u, 1u),
+};
+
+#define ROBOT_CMD_UPLOAD_SIGNAL_COUNT ((uint8_t)(sizeof(robot_cmd_upload_signals) / sizeof(robot_cmd_upload_signals[0])))
+
+#ifdef CHASSIS_BOARD
+static void RobotCMD485SlaveRecvCallback(RS485Instance *instance, void *arg)
+{
+    RobotCMD485SendItems(instance,
+                         robot_cmd_upload_signals,
+                         ROBOT_CMD_UPLOAD_SIGNAL_COUNT,
+                         &chassis_fetch_data_uart,
+                         &upload_tx_state);
+    (void)RobotCMD485RecvItems(instance,
+                               robot_cmd_ctrl_signals,
+                               ROBOT_CMD_CTRL_SIGNAL_COUNT,
+                               &chassis_rs485_recv);
+    (void)arg;
+}
+#endif
+
+void RobotCMDInit()
+{
+    gimbal_cmd_pub  = PubRegister("gimbal_cmd", sizeof(Gimbal_Ctrl_Cmd_s));
+    gimbal_feed_sub = SubRegister("gimbal_feed", sizeof(Gimbal_Upload_Data_s));
+    shoot_cmd_pub   = PubRegister("shoot_cmd", sizeof(Shoot_Ctrl_Cmd_s));
+    shoot_feed_sub  = SubRegister("shoot_feed", sizeof(Shoot_Upload_Data_s));
+#ifdef CHASSIS_BOARD
+    ui_cmd_pub  = PubRegister("ui_cmd", sizeof(UI_Cmd_s));
+    ui_feed_sub = SubRegister("ui_feed", sizeof(UI_Upload_Data_s));
+    chassis_cmd_send.power_limit=100;//预设功率,防止没有裁判系统车动不了
+    referee_data = RefereeHardwareInit(&huart6); // 裁判系统初始化,会同时初始化UI
+    //初始化双板通信，底盘板作为从机，云台板作为主机，底盘板接收云台板的控制数据并反馈底盘状态给云台板
+    rs485_slaver_instance = RobotCMD485InitSlave(&huart1); // 双板通信串口
+    RobotCMD485TxStateInit(&upload_tx_state,
+                           robot_cmd_upload_signals,
+                           ROBOT_CMD_UPLOAD_SIGNAL_COUNT);
+    RS485SetRecvCallback(rs485_slaver_instance, RobotCMD485SlaveRecvCallback, NULL);
+    // 注册底盘控制的发布者和订阅者
+    chassis_cmd_pub  = PubRegister("chassis_cmd", sizeof(Chassis_Ctrl_Cmd_s));
+    chassis_feed_sub = SubRegister("chassis_feed", sizeof(Chassis_Upload_Data_s));
+    chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW; //预设底盘模式为跟随云台
+#endif
+
+#ifdef GIMBAL_BOARD
+    rc_data = RemoteControlInit(&huart6); // 修改为对应串口,注意如果是自研板dbus协议串口需选用添加了反相器的那个
+#if defined(VISION_USE_VCP)
+    HostInstanceConf host_conf0 = {
+        .comm_mode = HOST_VCP,
+        .RECV_SIZE = NUC_RECV_SIZE,
+        .rx_decode_callback = RobotCMDVisionRxDecode,
+    };
+    host_instance = HostInit(&host_conf0,100); // 视觉通信串口
+#endif
+    //初始化双板通信，底盘板作为从机，云台板作为主机，底盘板接收云台板的控制数据并反馈底盘状态给云台板
+    rs485_master_instance = RobotCMD485InitMaster(&huart1);// 双板通信串口
+    RobotCMD485TxStateInit(&ctrl_tx_state,
+                           robot_cmd_ctrl_signals,
+                           ROBOT_CMD_CTRL_SIGNAL_COUNT);
+
+#endif
+
+    robot_state = ROBOT_READY; // 启动时机器人进入工作模式,后续加入所有应用初始化完成之后再进入
+}
+
+#ifdef CHASSIS_BOARD
+/**
+ * @brief  判断各种ID，选择客户端ID
+ * @param  referee_info_t *referee_info
+ * @retval none
+ * @attention
+ */
+static void DeterminRobotID()
+{
+    // id小于7是红色,大于7是蓝色,0为红色，1为蓝色   #define Robot_Red 0    #define Robot_Blue 1
+    referee_data->referee_id.Robot_Color       = referee_data->GameRobotState.robot_id == 1 ? Robot_Red : Robot_Blue;
+    referee_data->referee_id.Cilent_ID         = 0x0100 + referee_data->GameRobotState.robot_id; // 计算客户端ID
+    referee_data->referee_id.Robot_ID          = referee_data->GameRobotState.robot_id;          // 计算机器人ID
+    referee_data->referee_id.Receiver_Robot_ID = 0;
+}
+#endif
+
+float yaw_control;   // 遥控器YAW自由度输入值
+float pitch_control; // 遥控器PITCH自由度输入值
+volatile float pitch_up_cmd_lower_limit_rad = 0.0f;
+volatile float pitch_up_cmd_upper_limit_rad = 0.0f;
+volatile float pitch_up_motor_imu_slope = 1.0060169f;
+volatile uint8_t pitch_up_cmd_limit_active = 0U;
+volatile float pitch_coupled_imu_lower_limit_rad = 0.0f;
+volatile float pitch_coupled_imu_upper_limit_rad = 0.0f;
+volatile float pitch_coupled_imu_estimate_rad = 0.0f;
+volatile float pitch_coupled_imu_error_rad = 0.0f;
+volatile uint8_t pitch_coupled_cmd_limit_active = 0U;
+
+static float RobotCMDWrap180Deg(float angle_deg)
+{
+    while (angle_deg > 180.0f) {
+        angle_deg -= 360.0f;
+    }
+    while (angle_deg < -180.0f) {
+        angle_deg += 360.0f;
+    }
+    return angle_deg;
+}
+
+/**
+ * @brief 根据gimbal app传回的当前电机角度计算和零位的误差
+ *        单圈绝对角度的范围是0~360,说明文档中有图示
+ * @todo  将单圈角度修改为-180~180
+ *
+ */
+static void  CalcOffsetAngle()
+{
+    const float yaw_current_deg =
+        (float)gimbal_fetch_data.yaw_motor_single_round_angle;
+    const float yaw_forward_deg = YAW_DM_Forward_ANGLE_POS * RAD_TO_ANGLE;
+    static float gimbal_yaw_current_angle; // 云台yaw轴当前角度
+    static float gimbal_yaw_set_angle;     // 云台yaw轴目标角度
+
+    chassis_cmd_send.offset_angle =
+        -RobotCMDWrap180Deg(yaw_current_deg - yaw_forward_deg);
+    gimbal_yaw_current_angle =
+        gimbal_fetch_data.gimbal_imu_data->output.Yaw_total_angle_deg;
+    gimbal_yaw_set_angle = yaw_control;
+    chassis_cmd_send.gimbal_error_angle =
+        gimbal_yaw_set_angle - gimbal_yaw_current_angle;
+}
+
+#ifdef CHASSIS_BOARD
+static uint8_t RobotCMDHoleYawOffsetReady(float offset_deg)
+{
+    return (fabsf(offset_deg - HOLE_YAW_OFFSET_TARGET_DEG) <= HOLE_READY_THRESHOLD_DEG) ? 1u : 0u;
+}
+#endif
+
+#ifdef GIMBAL_BOARD
+static uint8_t RobotCMDHoleDownRestoreReady(void)
+{
+    return (fabsf(gimbal_fetch_data.pitch_down_motor_pos_rad - HOLE_DOWN_RESTORE_TARGET_RAD) <=
+            HOLE_READY_THRESHOLD_RAD) ? 1u : 0u;
+}
+
+static void RobotCMDUpdateHoleModeState(void)
+{
+    if (gimbal_cmd_send.gimbal_mode == GIMBAL_HOLE_MODE) {
+        robot_cmd_hole_restore_active = 0u;
+    } else if (robot_cmd_last_gimbal_mode == GIMBAL_HOLE_MODE) {
+        /*
+         * 狗洞退出后先把 pitch 控制基准拉回 0，并让 pitch 任务单独把 down 轴恢复。
+         * down 没回到默认位置前，底盘 follow/rotate 不能重新接管，避免机械姿态还没收回就转车。
+        */
+        robot_cmd_hole_restore_active = 1u;
+        pitch_control = 0.0f;
+        gimbal_cmd_send.pitch = 0.0f;
+    }
+
+    if (robot_cmd_hole_restore_active != 0u && RobotCMDHoleDownRestoreReady() != 0u) {
+        robot_cmd_hole_restore_active = 0u;
+    }
+
+    /*
+     * hole_yaw_ready 来自底盘板 offset 闭环结果。云台板只消费这个跨板状态，
+     * 不在本地猜测底盘是否已经转到 -67deg。
+     */
+    gimbal_cmd_send.hole_yaw_ready = chassis_fetch_data_uart.hole_yaw_ready;
+    gimbal_cmd_send.hole_restore_active = robot_cmd_hole_restore_active;
+    robot_cmd_last_gimbal_mode = gimbal_cmd_send.gimbal_mode;
+}
+#endif
+/**
+ * @brief 云台Yaw轴反馈值改单圈角度后过圈处理
+ *
+ */
+static void YawControlProcess()
+{
+    float yaw_measure_deg = gimbal_fetch_data.gimbal_imu_data->output.Yaw_total_angle_deg;
+    if (yaw_control - yaw_measure_deg > 180.0f) { //读取连续展开 yaw 数据进行过圈处理
+        yaw_control -= 360.0f;
+    } else if (yaw_control - yaw_measure_deg < -180.0f) {
+        yaw_control += 360.0f;
+    }
+}
+
+static float heat_coef;
+
+static void HeatControl()
+{
+    if (shoot_cmd_send.friction_mode == FRICTION_OFF) {
+        shoot_cmd_send.load_mode = LOAD_STOP;
+    }
+    static float rate_coef;
+    if (heat_coef == 1)
+        rate_coef = 1;
+    else if (heat_coef >= 0.8 && heat_coef < 1)
+        rate_coef = 0.8;
+    else if (heat_coef >= 0.6 && heat_coef < 0.8)
+        rate_coef = 0.6;
+    else if (heat_coef < 0.6)
+        rate_coef = 0.4;
+    heat_coef = ((referee_data->GameRobotState.shooter_id1_42mm_cooling_limit - referee_data->PowerHeatData.shooter_17mm_heat0 + rate_coef * referee_data->GameRobotState.shooter_id1_42mm_cooling_rate) * 1.0f) / (1.0f * referee_data->GameRobotState.shooter_id1_42mm_cooling_limit);
+    // 新热量管理
+    if (referee_data->GameRobotState.shooter_id1_42mm_cooling_limit - 40 + 30 * heat_coef - shoot_fetch_data.shooter_local_heat <= shoot_fetch_data.shooter_heat_control) {
+    //    shoot_cmd_send.load_mode = LOAD_STOP;
+    }
+}
+
+/**
+ * @brief  紧急停止,包括遥控器左上侧拨轮打满/重要模块离线/双板通信失效等
+ *
+ * @todo   后续修改为遥控器离线则电机停止(关闭遥控器急停),通过给遥控器模块添加daemon实现
+ */
+static void EmergencyHandler()
+{
+    gimbal_cmd_send.gimbal_mode   = GIMBAL_ZERO_FORCE;
+    chassis_cmd_send.chassis_mode = CHASSIS_ZERO_FORCE;
+    chassis_cmd_send.mecanum_force_enable = 0u;
+    shoot_cmd_send.friction_mode  = FRICTION_OFF;
+    shoot_cmd_send.load_mode      = LOAD_STOP;
+    shoot_cmd_send.shoot_mode     = SHOOT_OFF;
+    SuperCap_flag_from_user     = SUPERCAP_UNUSE;
+    // LOGERROR("[CMD] emergency stop!");
+    (void)0;
+}
+
+#define PITCH_COUPLED_IMU_UP_COEF          0.9938710f
+#define PITCH_COUPLED_IMU_DOWN_COEF        1.0048164f
+#define PITCH_COUPLED_IMU_OFFSET_RAD       (-1.1482353f)
+#define PITCH_COUPLED_DOWN_VALID_MIN_RAD   1.30f
+#define PITCH_COUPLED_DOWN_VALID_MAX_RAD   2.50f
+
+static uint8_t pitch_coupled_cmd_limit_has_valid = 0U;
+
+static float PitchCmdClampFloat(float value, float lower, float upper)
+{
+    if (value > upper) {
+        return upper;
+    }
+    if (value < lower) {
+        return lower;
+    }
+    return value;
+}
+
+static float PitchCoupledUpLimitCoordRad(float raw_pos_rad)
+{
+    const float half_period = PITCH_UP_MOTOR_WRAP_PERIOD_RAD * 0.5f;
+
+    while ((raw_pos_rad - PITCH_UP_MOTOR_UNWRAP_CENTER_RAD) > half_period) {
+        raw_pos_rad -= PITCH_UP_MOTOR_WRAP_PERIOD_RAD;
+    }
+    while ((raw_pos_rad - PITCH_UP_MOTOR_UNWRAP_CENTER_RAD) < -half_period) {
+        raw_pos_rad += PITCH_UP_MOTOR_WRAP_PERIOD_RAD;
+    }
+    return raw_pos_rad;
+}
+
+static float PitchCoupledEstimateImuRad(float up_limit_coord_rad,
+                                        float down_pos_rad)
+{
+    return PITCH_COUPLED_IMU_UP_COEF * up_limit_coord_rad -
+           PITCH_COUPLED_IMU_DOWN_COEF * down_pos_rad +
+           PITCH_COUPLED_IMU_OFFSET_RAD;
+}
+
+static float PitchCoupledDynamicUpperLimitRad(float down_pos_rad)
+{
+    float upper_limit_rad =
+        PitchCoupledEstimateImuRad(PitchCoupledUpLimitCoordRad(PITCH_UP_MOTOR_RAW_LOW_LIMIT_RAD),
+                                   down_pos_rad);
+
+    if (upper_limit_rad < PITCH_IMU_CMD_HARD_LOWER_LIMIT_RAD) {
+        upper_limit_rad = PITCH_IMU_CMD_HARD_LOWER_LIMIT_RAD;
+    }
+
+    return upper_limit_rad;
+}
+
+static uint8_t PitchCoupledFeedbackValid(float down_pos_rad)
+{
+    if (gimbal_fetch_data.gimbal_imu_data == NULL) {
+        return 0U;
+    }
+
+    return (down_pos_rad >= PITCH_COUPLED_DOWN_VALID_MIN_RAD) &&
+           (down_pos_rad <= PITCH_COUPLED_DOWN_VALID_MAX_RAD);
+}
+
+static void PitchCoupledUpdateImuLimits(float down_pos_rad)
+{
+    const float up_pos_rad =
+        PitchCoupledUpLimitCoordRad(gimbal_fetch_data.pitch_up_motor_pos_rad);
+    const float imu_pitch_rad = gimbal_fetch_data.pitch_up_imu_rad;
+
+    pitch_coupled_imu_estimate_rad =
+        PitchCoupledEstimateImuRad(up_pos_rad, down_pos_rad);
+    pitch_coupled_imu_error_rad = imu_pitch_rad - pitch_coupled_imu_estimate_rad;
+
+    pitch_coupled_imu_lower_limit_rad = PITCH_IMU_CMD_HARD_LOWER_LIMIT_RAD;
+    pitch_coupled_imu_upper_limit_rad =
+        PitchCoupledDynamicUpperLimitRad(down_pos_rad);
+
+    pitch_up_cmd_lower_limit_rad = pitch_coupled_imu_lower_limit_rad;
+    pitch_up_cmd_upper_limit_rad = pitch_coupled_imu_upper_limit_rad;
+    pitch_up_motor_imu_slope = PITCH_COUPLED_IMU_UP_COEF;
+}
+
+static void PitchCoupledLimitPitchControlByImu(void)
+{
+    /*
+     * pitch_control 是按 IMU pitch 角给出的目标值，而机械限位实际来自
+     * pitch up 电机。pitch down 电机位置会改变 up 电机角度和 IMU pitch
+     * 之间的映射关系，所以这里每个周期都用当前 down 电机角度，把 up=-2.97
+     * 换算成动态 IMU 上限，下限固定为 PITCH_IMU_CMD_HARD_LOWER_LIMIT_RAD：
+     *
+     *       imu ~= k_up * up_pos - k_down * down_pos + offset
+     *
+     * 然后把 pitch_control 限制在这个 IMU 窗口内，防止遥控器/鼠标输入在
+     * 到达机械边界后继续向外累加；反向输入仍然可以立刻离开限位。
+     * PitchCoupledUpdateImuLimits() 会同步更新旧的 pitch_up_cmd_* debug
+     * 变量，让原来的 Ozone 观察项还能继续使用。
+     */
+    const float down_pos_rad = gimbal_fetch_data.pitch_down_motor_pos_rad;
+    const float pitch_before = pitch_control;
+    const uint8_t feedback_valid = PitchCoupledFeedbackValid(down_pos_rad);
+
+    pitch_up_cmd_limit_active = 0U;
+    pitch_coupled_cmd_limit_active = 0U;
+
+    if (feedback_valid != 0U) {
+        PitchCoupledUpdateImuLimits(down_pos_rad);
+        pitch_coupled_cmd_limit_has_valid = 1U;
+    }
+
+    if (pitch_coupled_cmd_limit_has_valid == 0U) {
+        return;
+    }
+
+    pitch_control = PitchCmdClampFloat(pitch_control,
+                                       pitch_coupled_imu_lower_limit_rad,
+                                       pitch_coupled_imu_upper_limit_rad);
+    if (pitch_control != pitch_before) {
+        pitch_coupled_cmd_limit_active = 1U;
+    }
+    pitch_up_cmd_limit_active = pitch_coupled_cmd_limit_active;
+}
+
+void gimbal_limit(void)
+{
+    PitchCoupledLimitPitchControlByImu();
+}
+
+static void RemoteButtonEdgeUpdate(void)
+{
+    /*
+     * 图传遥控的 pause/custom_left/custom_right 是离散按键状态。
+     * 这里用 TEMP/LAST 做上升沿检测，把“按下一次”转换成锁存开关，
+     * 避免按住按键时在多个控制周期内反复翻转状态。
+     */
+    if (rc_update_flag != 1u)
+        return;
+
+    // pause：切换 NUC 自瞄/普通控制。
+    if (rc_data[TEMP].rc.pause && !rc_data[LAST].rc.pause)
+        remote_nuc_toggle_enable = remote_nuc_toggle_enable ? 0u : 1u;
+
+    // custom_right：切换摩擦轮开关。
+    if (rc_data[TEMP].rc.custom_right && !rc_data[LAST].rc.custom_right)
+        shoot_cmd_send.friction_mode = (shoot_cmd_send.friction_mode == FRICTION_ON) ? FRICTION_OFF : FRICTION_ON;
+
+    // custom_left：切换小陀螺/旋转状态。
+    if (rc_data[TEMP].rc.custom_left && !rc_data[LAST].rc.custom_left)
+        remote_rotate_enable = remote_rotate_enable ? 0u : 1u;
+
+    // 本周期遥控边沿已经消费，等待下一次遥控数据更新后再检测。
+    rc_update_flag = 0u;
+}
+/**
+ * @brief 控制输入为遥控器(调试时)的模式和控制量设置
+ */
+static void RemoteControlSet()
+{
+    RemoteButtonEdgeUpdate();
+    gimbal_cmd_send.gimbal_mode   = GIMBAL_GYRO_MODE;
+    shoot_cmd_send.shoot_rate   = 20; // 射频默认20Hz
+    shoot_cmd_send.shoot_mode=SHOOT_ON;
+    // N档遥控模式: pause锁存自瞄，自定义左键锁存小陀螺，自定义右键锁存摩擦轮。
+    // gimbal_cmd_send.nuc_mode = remote_nuc_toggle_enable ? version_control : none_version_control;
+    chassis_cmd_send.chassis_mode = remote_rotate_enable ? CHASSIS_ROTATE : CHASSIS_FOLLOW_GIMBAL_YAW;
+
+    // 扳机为按住发射；自瞄开启时仍需要视觉给出fire_advice才连续发射。
+
+    if (shoot_cmd_send.friction_mode == FRICTION_ON && rc_data[TEMP].rc.trigger)
+    {
+        if (gimbal_cmd_send.nuc_mode == none_version_control)
+            shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
+        // else if (fire_advice == 2)
+        //     shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
+        // else
+        //     shoot_cmd_send.load_mode = LOAD_STOP;
+    }
+    else
+    {
+        shoot_cmd_send.load_mode = LOAD_STOP;
+    }
+
+    // 云台控制输入来源：
+    // none_version_control: 直接使用遥控器摇杆
+    // version_control:      使用上位机给定角度
+    pitch_control -= PITCH_K * (float)rc_data[TEMP].rc.rocker_r1;
+    yaw_control -= YAW_K * (float)rc_data[TEMP].rc.rocker_r_;
+    // 左摇杆映射到底盘平移速度。
+    chassis_cmd_send.vx = 70.0f * (float)rc_data[TEMP].rc.rocker_l1;
+    chassis_cmd_send.vy = 70.0f * (float)rc_data[TEMP].rc.rocker_l_;
+    // 云台软件限位
+    gimbal_limit();
+    YawControlProcess();
+}
+
+ramp_t fb_ramp;
+ramp_t lr_ramp;
+ramp_t slow_ramp;
+
+/**
+ * @brief 键盘设定速度
+ *
+ */
+static void ChassisSet()
+{
+    // 键鼠控制时给底盘一个基准模式，后续可被 KeyGetMode 覆盖（例如 C 键切小陀螺）
+    chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;
+    // chassis_cmd_send.chassis_mode = CHASSIS_ZERO_FORCE;
+    // chassis_cmd_send.power_limit=100;//临时更改
+
+    // 底盘移动
+    static float current_speed_x = 0;
+    static float current_speed_y = 0;
+    // 前后移动（带 ramp，避免速度突变）
+    // 防止逃跑时关小陀螺按Ctrl进入慢速模式
+    if (rc_data[TEMP].key[KEY_PRESS].w) {
+        chassis_cmd_send.vx = (current_speed_x + (CHASSIS_SPEED - current_speed_x) * ramp_calc(&fb_ramp)); // vx鏂瑰悜寰呮祴
+        ramp_init(&slow_ramp, RAMP_TIME);                                                                  // 2000
+    } else if (rc_data[TEMP].key[KEY_PRESS].s) {
+        chassis_cmd_send.vx = (current_speed_x + (-CHASSIS_SPEED - current_speed_x) * ramp_calc(&fb_ramp));
+        ramp_init(&slow_ramp, RAMP_TIME);
+    } else if (rc_data[TEMP].key[KEY_PRESS_WITH_CTRL].w) { // 防止逃跑关小陀螺进入慢速移动
+        chassis_cmd_send.vx = (current_speed_x + (4000 - current_speed_x) * ramp_calc(&slow_ramp));
+        ramp_init(&fb_ramp, RAMP_TIME);
+    } else if (rc_data[TEMP].key[KEY_PRESS_WITH_CTRL].s) {
+        chassis_cmd_send.vx = (current_speed_x + (-4000 - current_speed_x) * ramp_calc(&slow_ramp));
+        ramp_init(&fb_ramp, RAMP_TIME);
+    } else {
+        chassis_cmd_send.vx = 0;
+        ramp_init(&fb_ramp, RAMP_TIME);
+    }
+
+    // 左右移动（带 ramp，避免速度突变）
+    if (rc_data[TEMP].key[KEY_PRESS].a) {
+        chassis_cmd_send.vy = (current_speed_y + (CHASSIS_SPEED - current_speed_y) * ramp_calc(&lr_ramp));
+        ramp_init(&slow_ramp, RAMP_TIME);
+    } else if (rc_data[TEMP].key[KEY_PRESS].d) {
+        chassis_cmd_send.vy = (current_speed_y + (-CHASSIS_SPEED - current_speed_y) * ramp_calc(&lr_ramp));
+        ramp_init(&slow_ramp, RAMP_TIME);
+    } else if (rc_data[TEMP].key[KEY_PRESS_WITH_CTRL].a) {
+        chassis_cmd_send.vy = (current_speed_y + (+4000 - current_speed_y) * ramp_calc(&fb_ramp));
+        ramp_init(&lr_ramp, RAMP_TIME);
+    } else if (rc_data[TEMP].key[KEY_PRESS_WITH_CTRL].d) {
+        chassis_cmd_send.vy = (current_speed_y + (-4000 - current_speed_y) * ramp_calc(&fb_ramp));
+        ramp_init(&lr_ramp, RAMP_TIME);
+    } else {
+        chassis_cmd_send.vy = 0;
+        ramp_init(&lr_ramp, RAMP_TIME);
+    }
+
+    current_speed_x = chassis_cmd_send.vx;
+    current_speed_y = chassis_cmd_send.vy;
+}
+/**
+ * @brief 鼠标移动云台
+ *
+ */
+static void GimbalSet()
+{
+    // 键鼠控制下，云台默认用陀螺仪模式：
+    // 鼠标输入提供增量控制；若开启自瞄则直接使用视觉给定值。
+
+    gimbal_cmd_send.gimbal_mode = GIMBAL_GYRO_MODE;
+    if(gimbal_cmd_send.nuc_mode == none_version_control)
+    {
+        yaw_control -= rc_data[TEMP].mouse.x / 500.0f;
+        pitch_control += rc_data[TEMP].mouse.y / 15000.0f;
+    }
+    else
+    {
+        yaw_control = gimbal_cmd_send.yaw_version;
+        pitch_control = gimbal_cmd_send.pitch_version;
+    }
+    static float pitch_rotato_vision,yaw_rotato_vision;
+    // E 键/右键按住时，根据视觉误差做补偿（PID）
+    if(rc_data[TEMP].key[KEY_PRESS].e){
+        if(fabs(gimbal_cmd_send.pitch_version)<16){
+            pitch_rotato_vision=PIDCalculate(&PITCH_version_PID,gimbal_cmd_send.pitch_version,0);
+            // pitch_control+=PIDCalculate(&PITCH_version_PID,gimbal_cmd_send.pitch_version,0);
+            if(fabs(pitch_rotato_vision)<0.035)pitch_control+=pitch_rotato_vision;}
+        // if(fabs(gimbal_cmd_send.pitch_version)<16)pitch_control+=PIDCalculate(&PITCH_version_PID,gimbal_cmd_send.pitch_version,0);
+        if(fabs(gimbal_cmd_send.yaw_version)<20){
+            yaw_rotato_vision=PIDCalculate(&YAW_version_PID,gimbal_cmd_send.yaw_version,0);
+            // yaw_control-=PIDCalculate(&YAW_version_PID,gimbal_cmd_send.yaw_version,0);
+            if(fabs(yaw_rotato_vision<0.08))yaw_control-=yaw_rotato_vision;
+        }
+    }
+    else if (rc_data[TEMP].mouse.press_r){
+        // pitch_control+=PIDCalculate(&PITCH_version_PID,gimbal_cmd_send.pitch_version,0);
+        // yaw_control-=PIDCalculate(&YAW_version_PID,gimbal_cmd_send.yaw_version,0);
+        if(fabs(gimbal_cmd_send.pitch_version)<16){
+            
+            pitch_rotato_vision=PIDCalculate(&PITCH_version_PID,gimbal_cmd_send.pitch_version,0);
+            // pitch_control+=PIDCalculate(&PITCH_version_PID,gimbal_cmd_send.pitch_version,0);
+            if(fabs(pitch_rotato_vision)<0.035)pitch_control+=pitch_rotato_vision;
+            
+        }
+    }
+    
+    // if(fabs(gimbal_cmd_send.pitch_version)<16)pitch_control+=PIDCalculate(&PITCH_version_PID,gimbal_cmd_send.pitch_version,0);
+    // if(fabs(gimbal_cmd_send.yaw_version)<20)yaw_control-=PIDCalculate(&YAW_version_PID,gimbal_cmd_send.yaw_version,0);
+    YawControlProcess();
+    gimbal_limit();
+}
+
+/**
+ * @brief 键鼠设定机器人发射模式
+ *
+ */
+static void ShootSet()
+{
+    // 发射逻辑说明：
+    // 1) 仅摩擦轮开启时，左键触发发射
+    // 2) 视觉模式下按 fire_advice 决定连发/停发
+    // 3) G 键强制反转处理卡弹
+    shoot_cmd_send.shoot_mode = SHOOT_ON;
+    shoot_cmd_send.shoot_rate = 30; // 射频默认30Hz
+
+    // 仅在摩擦轮开启时有效
+    if (shoot_cmd_send.friction_mode == FRICTION_ON) {
+        // 打弹，单击左键单发，长按连发
+        if (rc_data[TEMP].mouse.press_l) 
+        {
+            shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
+            // 打符，单发
+            // if (auto_rune == 1) {
+            //     shoot_cmd_send.load_mode = LOAD_1_BULLET;
+            // } else {
+            //     shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
+            // }
+        } else {
+            if (gimbal_cmd_send.nuc_mode == none_version_control)
+            {
+                shoot_cmd_send.load_mode = LOAD_STOP;
+            }
+            else
+            {
+                if (fire_advice == 2)
+                {
+                    shoot_cmd_send.load_mode = LOAD_BURSTFIRE;
+                }
+                else
+                {
+                    shoot_cmd_send.load_mode = LOAD_STOP;
+                }
+            }
+            
+        }
+    } else {
+        shoot_cmd_send.load_mode = LOAD_STOP;
+    }
+    if (rc_data[TEMP].key[KEY_PRESS].g){
+        shoot_cmd_send.load_mode = LOAD_REVERSE;
+    }
+    if(remote_nuc_toggle_enable || rc_data[TEMP].mouse.press_r)
+    {
+        gimbal_cmd_send.nuc_mode = version_control;
+
+    }
+    else
+    {
+        gimbal_cmd_send.nuc_mode = none_version_control;
+    }
+    HeatControl();
+}
+
+/**
+ * @brief 键盘处理模式标志位
+ *
+ */
+
+static void KeyGetMode()
+{
+    // 键盘模式切换：
+    // C: 底盘 跟随<->旋转
+    // V: 摩擦轮 开/关
+    // Shift: 超电使能
+    // Ctrl: 打符模式标志
+    switch (rc_data[TEMP].key_count[KEY_PRESS][Key_C] % 2) {
+        case 1:
+            if (chassis_cmd_send.chassis_mode == CHASSIS_FOLLOW_GIMBAL_YAW)
+                chassis_cmd_send.chassis_mode = CHASSIS_ROTATE;
+            break;
+        case 0:
+            if (chassis_cmd_send.chassis_mode == CHASSIS_ROTATE)
+                chassis_cmd_send.chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;
+            break;
+    }
+    switch (rc_data[TEMP].key_count[KEY_PRESS][Key_V] % 2) {
+        case 1:
+            if (shoot_cmd_send.friction_mode != FRICTION_ON)
+                shoot_cmd_send.friction_mode = FRICTION_ON;
+            break;
+        case 0:
+            shoot_cmd_send.friction_mode = FRICTION_OFF;
+            break;
+    }
+    // switch (rc_data[TEMP].key_count[KEY_PRESS][Key_Z] % 2) {
+    //     chassis_mode_e temp;
+    //     temp=chassis_cmd_send.chassis_mode;
+    //     case 1:
+    //         if (chassis_cmd_send.chassis_mode == CHASSIS_REVERSE_ROTATE)
+    //             chassis_cmd_send.chassis_mode = temp;
+    //         break;
+    //     case 0:
+    //         if (chassis_cmd_send.chassis_mode == temp)
+    //             chassis_cmd_send.chassis_mode = CHASSIS_REVERSE_ROTATE;
+    //         break;
+    // }
+    switch (rc_data[TEMP].key[KEY_PRESS].r) {
+        case 1:
+            if (UI_SendFlag == 1) {
+                UI_SendFlag = 0;
+            }
+            break;
+        case 0:
+            UI_SendFlag = 1;
+            break;
+    }
+    
+    switch (rc_data[TEMP].key[KEY_PRESS].ctrl) {
+        case 1:
+            auto_rune = 1;
+            break;
+        case 0:
+            auto_rune = 0;
+            break;
+        default:
+            break;
+    }
+    switch (rc_data[TEMP].key[KEY_PRESS].shift) {
+        case 1:
+            SuperCap_flag_from_user = SUPERCAP_USE;
+            break;
+        case 0:
+            SuperCap_flag_from_user = SUPERCAP_UNUSE;
+            break;
+    }
+}
+
+/**
+ * @brief 机器人复位函数，按下Ctrl+Shift+r
+ *
+ *
+ */
+static void RobotReset()
+{
+    if (rc_data[TEMP].key[KEY_PRESS].shift && rc_data[TEMP].key[KEY_PRESS].ctrl && rc_data[TEMP].key[KEY_PRESS].r) {
+        osDelay(1000);
+        __set_FAULTMASK(1);
+        NVIC_SystemReset(); // 软件复位
+    }
+    if (rc_data[TEMP].key[KEY_PRESS].shift && rc_data[TEMP].key[KEY_PRESS].ctrl && rc_data[TEMP].key[KEY_PRESS].e) {
+    chassis_cmd_send_uart.reset_flag=7;
+    }
+}
+
+/**
+ * @brief 软件复位
+ *
+ */
+static void MouseKeySet()
+{
+    // 键鼠控制主流程：
+    // 底盘->云台->发射->模式键处理->复位检查
+    ChassisSet();
+    // C档键鼠模式下，右键临时自瞄；pause锁存自瞄优先保持开启。
+    gimbal_cmd_send.nuc_mode = (remote_nuc_toggle_enable || rc_data[TEMP].mouse.press_r) ? version_control : none_version_control;
+    GimbalSet();
+    ShootSet();
+    KeyGetMode();
+    RobotReset(); // 机器人复位处理
+}
+extern int32_t shoot_count; 
+// extern referee_info_t *referee_data_for_ui;
+uint8_t nuc_rx[8];
+
+float fp_pitch,fp_yaw,pitch_vel = 0;
+//-----------------------------------------------------------------------------------------NUC版本解码-----------------------------------------------------------------------------------------//
+#define NUC_FRAME_HEAD0 'C'
+#define NUC_FRAME_HEAD1 'B'
+
+#ifdef GIMBAL_BOARD
+typedef struct __attribute__((packed)) {
+    uint8_t head[2];
+    uint8_t mode;
+    float yaw;
+    float yaw_vel;
+    float yaw_acc;
+    float pitch;
+    float pitch_vel;
+    float pitch_acc;
+    uint16_t crc16;
+} VisionToGimbal;
+
+
+#endif
+void USB_Version_devode(){
+    float yaw_vel;
+    if (fifo_pack[0] != NUC_FRAME_HEAD0 || fifo_pack[1] != NUC_FRAME_HEAD1)
+        return;
+
+    fire_advice = fifo_pack[2];
+    
+    fp_yaw = uint8_to_float_manual(fifo_pack + 3);
+    yaw_vel = RAD_2_DEGREE * uint8_to_float_manual(fifo_pack + 7);
+    fp_pitch = uint8_to_float_manual(fifo_pack + 15);
+    pitch_vel = uint8_to_float_manual(fifo_pack + 19);
+    // 将视觉yaw速度作为前馈
+    vision_yaw_vel = yaw_vel;
+    if (fire_advice == 0)
+    {
+        gimbal_cmd_send.pitch_version = pitch_control;
+        gimbal_cmd_send.yaw_version = yaw_control;
+    }
+    else
+    {
+        gimbal_cmd_send.pitch_version = fp_pitch;
+        gimbal_cmd_send.yaw_version = RAD_2_DEGREE * fp_yaw;
+    }
+}
+
+static uint32_t nuc_rx_crc_ok_cnt = 0u;
+static uint32_t nuc_rx_crc_fail_cnt = 0u;
+
+static uint8_t NucCRC16Check(const uint8_t *frame, uint16_t len)
+{
+    if (frame == NULL || len < 3u)
+        return 0u;
+    return (Verify_CRC16_Check_Sum((uint8_t *)frame, len) == TRUE) ? 1u : 0u;
+}
+
+#ifdef GIMBAL_BOARD
+static void RobotCMDVisionRxDecode(HostInstance *instance, const uint8_t *buf, uint16_t len)
+{
+    (void)instance;
+    g_vision_rx_debug.online_frame_cnt++;
+
+    if (buf == NULL || len != (uint16_t)sizeof(VisionToGimbal)) {
+        g_vision_rx_debug.len_fail_cnt++;
+        return;
+    }
+
+    if (buf[0] != NUC_FRAME_HEAD0 || buf[1] != NUC_FRAME_HEAD1) {
+        g_vision_rx_debug.head_fail_cnt++;
+        return;
+    }
+
+    if (NucCRC16Check(buf, (uint16_t)sizeof(VisionToGimbal)) == 0u) {
+        g_vision_rx_debug.crc_fail_cnt++;
+        return;
+    }
+
+    VisionToGimbal frame;
+    memcpy(&frame, buf, sizeof(frame));
+
+    g_vision_rx_debug.crc_ok_cnt++;
+    g_vision_rx_debug.last_mode = frame.mode;
+    g_vision_rx_debug.yaw = frame.yaw;
+    g_vision_rx_debug.yaw_vel = frame.yaw_vel;
+    g_vision_rx_debug.yaw_acc = frame.yaw_acc;
+    g_vision_rx_debug.pitch = frame.pitch;
+    g_vision_rx_debug.pitch_vel = frame.pitch_vel;
+    g_vision_rx_debug.pitch_acc = frame.pitch_acc;
+}
+#endif
+
+/* 机器人核心控制任务,200Hz频率运行(必须高于视觉发送频率) */
+static void RobotCMDApplyControlInput(void)
+{
+    // 控制源仲裁：
+    // C档 -> 键鼠
+    // N档 -> 遥控
+    // S档或遥控丢失 -> 急停
+    if (RC_LOST || switch_is_s(rc_data[TEMP].rc.switch_mode))
+        EmergencyHandler();
+    else if (switch_is_c(rc_data[TEMP].rc.switch_mode))
+        MouseKeySet();
+    else if (switch_is_n(rc_data[TEMP].rc.switch_mode))
+        RemoteControlSet();
+    else
+        EmergencyHandler();
+    //如果是刚进入控制，云台角度不变
+    if(gimbal_cmd_send.gimbal_mode==GIMBAL_GYRO_MODE||gimbal_cmd_send.gimbal_mode==GIMBAL_MOTOR_MODE)
+        if(gimbal_last_mode!=gimbal_cmd_send.gimbal_mode){
+            yaw_control=gimbal_fetch_data.gimbal_imu_data->output.Yaw_total_angle_deg;
+            pitch_control=gimbal_fetch_data.gimbal_imu_data->output.INS_angle[INS_PITCH_ADDRESS_OFFSET];
+        }
+    static uint8_t nuc_mode_last=0;
+    if(!remote_nuc_toggle_enable){
+        gimbal_cmd_send.nuc_mode = none_version_control;
+        //恢复手瞄的时候不变云台
+        if(nuc_mode_last!=gimbal_cmd_send.nuc_mode){
+            yaw_control=gimbal_fetch_data.gimbal_imu_data->output.Yaw_total_angle_deg;
+            pitch_control=gimbal_fetch_data.gimbal_imu_data->output.INS_angle[INS_PITCH_ADDRESS_OFFSET];
+        }
+        else {
+            gimbal_cmd_send.yaw   = yaw_control;
+            gimbal_cmd_send.pitch = pitch_control;  
+        }
+    }
+    else {
+        gimbal_cmd_send.nuc_mode = version_control;
+        gimbal_cmd_send.yaw     =  gimbal_fetch_data.gimbal_imu_data->output.Yaw_total_angle_deg+g_vision_rx_debug.yaw - yaw_reverse;
+    }  
+    nuc_mode_last=gimbal_cmd_send.nuc_mode;
+}
+
+static void RobotCMDUpdateShootReferee(uint16_t cooling_rate, uint16_t referee_heat, uint16_t cooling_limit)
+{
+    memcpy(&shoot_cmd_send.shooter_heat_cooling_rate, &cooling_rate, sizeof(uint16_t));
+    memcpy(&shoot_cmd_send.shooter_referee_heat, &referee_heat, sizeof(uint16_t));
+    memcpy(&shoot_cmd_send.shooter_cooling_limit, &cooling_limit, sizeof(uint16_t));
+    memcpy(&shoot_cmd_send.bullet_speed, &referee_data->ShootData.bullet_speed, sizeof(float));
+}
+
+#ifdef CHASSIS_BOARD
+static void RobotCMDTaskChassisBoard(void)
+{
+    //Judge_Uart();//判断串口是否卡死且没有进入错误中断回调重新使能
+    DeterminRobotID(); //根据裁判系统数据判断机器人ID
+    //获得底盘、云台、发射的控制数据
+    SubGetMessage(gimbal_feed_sub, &gimbal_fetch_data);
+    SubGetMessage(shoot_feed_sub, &shoot_fetch_data);
+    SubGetMessage(chassis_feed_sub, (void *)&chassis_fetch_data);
+    // RS485控制数据在串口接收回调中解算；这里直接使用最近一次解算后的结果。
+        
+    //判断是否需要重置底盘板
+    // if (chassis_rs485_recv.reset_flag != 0u) {
+    //     osDelay(500);
+    //     __set_FAULTMASK(1);
+    //     NVIC_SystemReset();
+    // }
+    CalcOffsetAngle();
+/*--------------------------底盘反馈数据赋值--------------------------------------------------------------------------------*/
+    Chassis_Upload_Data_s_uart upload_snapshot = {0};
+    const INS_Instance *gimbal_imu = gimbal_fetch_data.gimbal_imu_data;
+    upload_snapshot.yaw_motor_single_round_angle = gimbal_fetch_data.yaw_motor_single_round_angle;
+    upload_snapshot.yaw_total_angle = gimbal_fetch_data.yaw_total_angle;
+    upload_snapshot.yaw_ecd = gimbal_fetch_data.yaw_ecd;
+    upload_snapshot.chassis_yaw_gyro =
+        (gimbal_imu != NULL) ? gimbal_imu->INS_data.INS_gyro[INS_YAW_ADDRESS_OFFSET] : 0.0f;
+    upload_snapshot.chassis_pitch_angle =
+        (gimbal_imu != NULL) ? gimbal_imu->output.INS_angle[INS_PITCH_ADDRESS_OFFSET] : 0.0f;
+    upload_snapshot.initial_speed = referee_data->ShootData.bullet_speed;
+    upload_snapshot.color = referee_data->referee_id.Robot_Color;
+    upload_snapshot.yaw_angle_pidout = gimbal_fetch_data.yaw_angle_pidout;
+    upload_snapshot.yaw_motor_vel = gimbal_fetch_data.yaw_motor_vel;
+    upload_snapshot.hole_yaw_ready =
+        (chassis_rs485_recv.gimbal_mode == GIMBAL_HOLE_MODE) ?
+        RobotCMDHoleYawOffsetReady(chassis_cmd_send.offset_angle) : 0u;
+    chassis_fetch_data_uart = upload_snapshot;
+
+/*--------------------------底盘控制数据赋值--------------------------------------------------------------------------------*/
+    gimbal_cmd_send.yaw = chassis_rs485_recv.yaw_control;
+    gimbal_cmd_send.gimbal_mode = chassis_rs485_recv.gimbal_mode;
+    gimbal_cmd_send.nuc_mode = chassis_rs485_recv.nuc_mode;
+    gimbal_cmd_send.yaw_version = chassis_rs485_recv.nuc_yaw;
+    gimbal_cmd_send.yaw_measure_angle=chassis_rs485_recv.yaw_angle;
+    gimbal_cmd_send.yaw_measure_gyro=chassis_rs485_recv.yaw_gyro;
+    gimbal_cmd_send.yaw_ref_rad = chassis_rs485_recv.vision_yaw;
+    gimbal_cmd_send.yaw_ref_vel_rad_s = chassis_rs485_recv.vision_yaw_vel;
+    gimbal_cmd_send.yaw_ref_acc_rad_s2 = chassis_rs485_recv.vision_yaw_acc;
+    PubPushMessage(gimbal_cmd_pub, (void *)&gimbal_cmd_send);
+    shoot_cmd_send.load_mode = chassis_rs485_recv.load_mode;
+    shoot_cmd_send.shoot_mode = chassis_rs485_recv.shoot_mode;
+    shoot_cmd_send.shoot_count = chassis_rs485_recv.shoot_count;
+    shoot_cmd_send.friction_mode = chassis_rs485_recv.friction_mode;
+    PubPushMessage(shoot_cmd_pub, (void *)&shoot_cmd_send);
+    chassis_cmd_send.vx = chassis_rs485_recv.vx;
+    chassis_cmd_send.vy = chassis_rs485_recv.vy;
+    chassis_cmd_send.wz = chassis_rs485_recv.wz;
+    chassis_cmd_send.nuc_enable_flag=remote_nuc_toggle_enable;
+    chassis_cmd_send.chassis_mode = chassis_rs485_recv.chassis_mode;
+    chassis_cmd_send.gimbal_mode = chassis_rs485_recv.gimbal_mode;
+    //chassis_cmd_send.offset_angle = chassis_rs485_recv.offset_angle;
+    //chassis_cmd_send.gimbal_error_angle = chassis_rs485_recv.gimbal_error_angle;
+    chassis_cmd_send.power_limit = referee_data->GameRobotState.chassis_power_limit;
+    g_power_set = chassis_cmd_send.power_limit;
+    chassis_cmd_send.level = referee_data->GameRobotState.robot_level;
+    chassis_cmd_send.power_buffer = referee_data->PowerHeatData.chassis_power_buffer;
+    chassis_cmd_send.SuperCap_flag_from_user = chassis_rs485_recv.superCap_flag;
+    chassis_cmd_send.mecanum_force_enable = (chassis_rs485_recv.UI_SendFlag & MECANUM_FORCE_UI_FLAG_BIT) ? 1u : 0u;
+/*--------------------------发射数据更新--------------------------------------------------------------------------------*/
+    RobotCMDUpdateShootReferee(referee_data->GameRobotState.shooter_id1_42mm_cooling_rate,
+                               referee_data->PowerHeatData.shooter_42mm_heat,
+                               referee_data->GameRobotState.shooter_id1_42mm_cooling_limit);
+
+    PubPushMessage(chassis_cmd_pub, (void *)&chassis_cmd_send);
+/*--------------------------UI数据更新--------------------------------------------------------------------------------*/
+    referee_data_for_ui = referee_data;
+    {
+        uint8_t ui_send_flag_rx = (uint8_t)(chassis_rs485_recv.UI_SendFlag & UI_SEND_FLAG_MASK);
+        memcpy(&ui_cmd_send.ui_send_flag, &ui_send_flag_rx, sizeof(uint8_t));
+    }
+    memcpy(&ui_cmd_send.chassis_mode, &chassis_cmd_send.chassis_mode, sizeof(chassis_mode_e));
+    memcpy(&ui_cmd_send.chassis_attitude_angle, &gimbal_fetch_data.yaw_motor_single_round_angle, sizeof(uint16_t));
+    memcpy(&ui_cmd_send.friction_mode, &shoot_cmd_send.friction_mode, sizeof(friction_mode_e));
+    memcpy(&ui_cmd_send.rune_mode, &auto_rune, sizeof(uint8_t));
+    memcpy(&ui_cmd_send.SuperCap_mode, &chassis_rs485_recv.superCap_flag, sizeof(uint8_t));
+    memcpy(&ui_cmd_send.supercap_voltage, &chassis_fetch_data.cap_voltage, sizeof(float));
+    memcpy(&ui_cmd_send.Chassis_Ctrl_power, &chassis_fetch_data.chassis_power_output, sizeof(float));
+    memcpy(&ui_cmd_send.Chassis_power_limit, &referee_data->GameRobotState.chassis_power_limit, sizeof(uint16_t));
+    memcpy(&ui_cmd_send.Shooter_heat, &referee_data->PowerHeatData.shooter_42mm_heat, sizeof(uint16_t));
+    memcpy(&ui_cmd_send.cap_online_flag, &chassis_fetch_data.cap_online_flag, sizeof(uint8_t));
+    memcpy(&ui_cmd_send.nuc_flag, &chassis_rs485_recv.nuc_mode, sizeof(uint8_t));
+    memcpy(&ui_cmd_send.robot_level, &referee_data->GameRobotState.robot_level, sizeof(uint8_t));
+    PubPushMessage(ui_cmd_pub, (void *)&ui_cmd_send);
+}
+#endif
+#ifdef GIMBAL_BOARD
+static void RobotCMDTaskGimbalBoard(void)
+{
+    // NUC数据校验：回调中已memcpy到内部缓冲区，这里直接校验
+    // if (HostDataReady(host_instance)) {
+    //     memcpy(fifo_pack, HostGetRecvBuf(host_instance), HostGetRecvLen(host_instance));
+    //     if (fifo_pack[0] == NUC_FRAME_HEAD0 && fifo_pack[1] == NUC_FRAME_HEAD1) {
+    //         if (NucCRC16Check(fifo_pack, NUC_RECV_SIZE)) {
+    //             nuc_rx_crc_ok_cnt++;
+    //             USB_Version_devode();
+    //         } else {
+    //             nuc_rx_crc_fail_cnt++;
+    //         }
+    //     }
+    // }
+    //IWDG喂狗
+    HAL_IWDG_Refresh(&hiwdg);
+    // 底盘上传数据校验：回调中已memcpy到内部缓冲区，这里直接校验
+    if (RobotCMD485RecvItems(rs485_master_instance,
+                             robot_cmd_upload_signals,
+                             ROBOT_CMD_UPLOAD_SIGNAL_COUNT,
+                             &chassis_fetch_data_uart) > 0u) {
+        if (chassis_fetch_data_uart.color)
+            vision_send_data[8] = 1;
+        else
+            vision_send_data[8] = 0;
+    }
+
+    SubGetMessage(shoot_feed_sub, &shoot_fetch_data);
+    SubGetMessage(gimbal_feed_sub, &gimbal_fetch_data);
+    
+
+    RobotCMDApplyControlInput();
+
+    RobotCMDUpdateHoleModeState();
+    //CalcOffsetAngle();
+
+    //RobotCMDUpdateShootReferee(referee_data->GameRobotState.shooter_id1_42mm_cooling_rate,
+    //                           referee_data->PowerHeatData.shooter_17mm_heat0,
+    //                           referee_data->GameRobotState.shooter_id1_42mm_cooling_limit);
+    //将底盘控制数据赋值给结构体，并通过RS485发送给底盘板
+    chassis_cmd_send_uart.reset_flag = 0;
+    chassis_cmd_send_uart.vx = chassis_cmd_send.vx;
+    chassis_cmd_send_uart.vy = chassis_cmd_send.vy;
+    chassis_cmd_send_uart.wz = chassis_cmd_send.wz;
+    chassis_cmd_send_uart.offset_angle = chassis_cmd_send.offset_angle;
+    chassis_cmd_send_uart.gimbal_error_angle = chassis_cmd_send.gimbal_error_angle;
+    /*
+     * 狗洞退出恢复阶段只暂时拦截底盘 yaw 模式，让 down 先回安全位置；
+     * vx/vy 不在这里清零，避免额外改变驾驶员给出的平移命令。
+     */
+    chassis_cmd_send_uart.chassis_mode =
+        (robot_cmd_hole_restore_active != 0u) ? CHASSIS_NO_FOLLOW : chassis_cmd_send.chassis_mode;
+    chassis_cmd_send_uart.gimbal_mode = gimbal_cmd_send.gimbal_mode;
+    chassis_cmd_send_uart.yaw_control = gimbal_cmd_send.yaw;
+    chassis_cmd_send_uart.gimbal_yaw_signal_sound_angle =gimbal_fetch_data.yaw_motor_single_round_angle;//连续展开yaw角输出
+    chassis_cmd_send_uart.yaw_angle = gimbal_fetch_data.gimbal_imu_data->output.Yaw_total_angle_deg;//连续展开yaw角输出
+    chassis_cmd_send_uart.yaw_gyro = gimbal_fetch_data.gimbal_imu_data->INS_data.INS_gyro[INS_YAW_ADDRESS_OFFSET];//
+
+    chassis_cmd_send_uart.yaw_vel = vision_yaw_vel;    // 将视觉yaw速度通过RS485发送给下板
+    //chassis_cmd_send_uart.yaw_vel = 100;    // 将视觉yaw速度通过RS485发送给下板
+
+    chassis_cmd_send_uart.vision_yaw = g_vision_rx_debug.yaw;
+    chassis_cmd_send_uart.vision_yaw_vel = g_vision_rx_debug.yaw_vel;
+    chassis_cmd_send_uart.vision_yaw_acc = g_vision_rx_debug.yaw_acc;
+
+    chassis_cmd_send_uart.nuc_yaw = gimbal_cmd_send.yaw_version;
+    chassis_cmd_send_uart.shoot_mode = shoot_cmd_send.shoot_mode;
+    chassis_cmd_send_uart.load_mode = shoot_cmd_send.load_mode;
+    chassis_cmd_send_uart.shoot_count = shoot_count;
+    chassis_cmd_send_uart.friction_mode = shoot_cmd_send.friction_mode;
+    chassis_cmd_send_uart.nuc_mode = gimbal_cmd_send.nuc_mode;
+    //chassis_cmd_send_uart.UI_SendFlag = (uint8_t)(UI_SendFlag & UI_SEND_FLAG_MASK);
+    if (chassis_cmd_send.mecanum_force_enable) {
+        chassis_cmd_send_uart.UI_SendFlag |= MECANUM_FORCE_UI_FLAG_BIT;
+    }
+    chassis_cmd_send_uart.superCap_flag = SuperCap_flag_from_user;
+    RobotCMD485SendItems(rs485_master_instance,
+                         robot_cmd_ctrl_signals,
+                         ROBOT_CMD_CTRL_SIGNAL_COUNT,
+                         &chassis_cmd_send_uart,
+                         &ctrl_tx_state);//打包发送
+    gimbal_last_mode=gimbal_cmd_send.gimbal_mode;
+    PubPushMessage(gimbal_cmd_pub, (void *)&gimbal_cmd_send);
+    PubPushMessage(shoot_cmd_pub, (void *)&shoot_cmd_send);
+    vision_send_data[0] = NUC_FRAME_HEAD0;
+    vision_send_data[1] = NUC_FRAME_HEAD1;
+    vision_send_data[2] = 1;
+
+    // EularAngleToQuaternion(gimbal_fetch_data.gimbal_imu_data->output.INS_angle[INS_YAW_ADDRESS_OFFSET],
+    //                        gimbal_fetch_data.gimbal_imu_data->output.INS_angle[INS_PITCH_ADDRESS_OFFSET],
+    //                        gimbal_fetch_data.gimbal_imu_data->output.INS_angle[INS_ROLL_ADDRESS_OFFSET],
+    //                        p);//输出四元数
+
+    //memcpy(vision_send_data + 3, p, 16);
+    memcpy(vision_send_data + 3, &gimbal_fetch_data.gimbal_imu_data->INS_data.INS_quat[0], 4*sizeof(float));
+
+    
+    yaw_reverse = gimbal_fetch_data.gimbal_imu_data->output.INS_angle[INS_YAW_ADDRESS_OFFSET];
+    vision_pitch_gyro_rad_s =
+        gimbal_fetch_data.gimbal_imu_data->INS_data.INS_gyro[INS_PITCH_ADDRESS_OFFSET];
+    vision_pitch_rad =
+        gimbal_fetch_data.gimbal_imu_data->output.INS_angle[INS_PITCH_ADDRESS_OFFSET];
+    vision_roll_gyro_rad_s =
+        gimbal_fetch_data.gimbal_imu_data->INS_data.INS_gyro[INS_ROLL_ADDRESS_OFFSET];
+    float_to_uint8_manual(yaw_reverse, vision_send_data + 19);
+    
+    memcpy(vision_send_data + 23, &vision_roll_gyro_rad_s, sizeof(float));
+    float_to_uint8_manual(vision_pitch_rad, vision_send_data + 27);
+    memcpy(vision_send_data + 31, &vision_pitch_gyro_rad_s, sizeof(float));
+    memcpy(&vision_send_data[35], &chassis_fetch_data_uart.initial_speed, 4);
+    vision_send_data[39] = 0x0D;
+    Append_CRC16_Check_Sum(vision_send_data, 43);
+    HostSend(host_instance, vision_send_data, 43);
+}
+#endif
+
+#ifdef CHASSIS_BOARD
+static void RobotCMDTaskPostProcess(void)
+{
+    if (shoot_cmd_send.load_mode == LOAD_STOP) {
+        shoot_cmd_send.shoot_aim_angle = shoot_fetch_data.loader_angle - ONE_BULLET_DELTA_ANGLE;
+        shoot_cmd_send.Shoot_Once_Flag = 1;
+    } else if (shoot_cmd_send.load_mode == LOAD_1_BULLET) {
+        if (fabs(shoot_fetch_data.loader_angle - shoot_cmd_send.shoot_aim_angle) < 0.1)
+            shoot_cmd_send.Shoot_Once_Flag = 0;
+    }
+
+    PubPushMessage(shoot_cmd_pub, (void *)&shoot_cmd_send);
+    PubPushMessage(gimbal_cmd_pub, (void *)&gimbal_cmd_send);
+}
+#endif
+
+void RobotCMDTask()
+{
+    //CMD控制逻辑
+    #ifdef CHASSIS_BOARD
+    RobotCMDTaskChassisBoard();
+    //RobotCMDTaskPostProcess();//拨弹盘在下板
+    #elif defined(GIMBAL_BOARD)
+    RobotCMDTaskGimbalBoard();
+    #endif
+
+}
+
+

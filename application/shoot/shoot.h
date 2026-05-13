@@ -1,0 +1,27 @@
+#ifndef SHOOT_H
+#define SHOOT_H
+
+#define MAX_HISTROY 10
+#define Fliter_windowSize 5.0f
+#define BLOCK_CURRENT 10000
+#define REVERSE_CURRENT 4000
+
+/**
+ * @brief 发射初始化,会被RobotInit()调用
+ * 
+ */
+void ShootInit();
+
+/**
+ * @brief 云台板发射任务
+ * 
+ */
+void ShootTask_Gimbal(void);
+
+/**
+ * @brief 底盘板发射任务
+ * 
+ */
+void ShootTask_Chassis(void);
+extern int tt;
+#endif // SHOOT_H

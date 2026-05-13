@@ -1,0 +1,18 @@
+# Local debug tool installs
+.tools/
+
+# CMake build output
+/build/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+/Makefile
+/*.elf
+/*.map
+/*.hex
+/*.bin
+
+# macOS
+.DS_Store

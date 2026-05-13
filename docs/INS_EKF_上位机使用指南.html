@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>INS EKF 上位机使用指南</title>
+<style>
+  body { font-family: "Microsoft YaHei", "SimHei", sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; line-height: 1.7; }
+  h1 { text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; }
+  h2 { color: #1a5276; border-left: 4px solid #1a5276; padding-left: 10px; margin-top: 30px; }
+  h3 { color: #2c3e50; margin-top: 20px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+  th, td { border: 1px solid #aaa; padding: 6px 10px; text-align: left; font-size: 13px; }
+  th { background: #eaf2f8; }
+  tr:nth-child(even) { background: #f9f9f9; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+  pre { background: #2d2d2d; color: #f8f8f2; padding: 14px; border-radius: 6px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+  .note { background: #fef9e7; border-left: 4px solid #f39c12; padding: 10px 14px; margin: 12px 0; font-size: 13px; }
+  .frame-diagram { font-family: monospace; background: #f4f4f4; padding: 12px; border-radius: 4px; text-align: center; font-size: 13px; letter-spacing: 1px; }
+  @media print { body { margin: 20px; } pre { font-size: 11px; } }
+</style>
+</head>
+<body>
+
+<h1>INS EKF 上位机使用指南</h1>
+<p style="text-align:center; color:#777;">Infantry RMUC 2026 &mdash; UART6 调参通信协议</p>
+
+<h2>1. 串口配置</h2>
+<table>
+  <tr><th>项目</th><th>值</th></tr>
+  <tr><td>接口</td><td>UART6</td></tr>
+  <tr><td>波特率</td><td>由 CubeMX .ioc 配置决定（请查看工程）</td></tr>
+  <tr><td>数据位 / 停止位 / 校验</td><td>8N1</td></tr>
+  <tr><td>STM32 发送频率</td><td>100 Hz（每 10 ms 一帧）</td></tr>
+</table>
+
+<h2>2. 接收数据（STM32 &rarr; PC）</h2>
+<h3>2.1 协议：VOFA+ JustFloat</h3>
+<p>每帧由 <strong>36 个 float（little-endian）</strong> + <strong>4 字节帧尾</strong>组成：</p>
+<div class="frame-diagram">
+  [float_0][float_1]...[float_35][0x00][0x00][0x80][0x7F]
+</div>
+<p>总字节数：36 &times; 4 + 4 = <strong>148 字节/帧</strong></p>
+
+<div class="note">
+  <strong>使用方式：</strong>打开 VOFA+ 软件，选择 <code>JustFloat</code> 协议，连接对应串口即可实时显示波形。
+</div>
+
+<h3>2.2 通道定义</h3>
+<table>
+  <tr><th>CH</th><th>含义</th><th>单位</th></tr>
+  <tr><td>0</td><td>Yaw</td><td>&deg;</td></tr>
+  <tr><td>1</td><td>Yaw 累计角</td><td>&deg;</td></tr>
+  <tr><td>2</td><td>gyro_x</td><td>&deg;/s</td></tr>
+  <tr><td>3</td><td>gyro_y</td><td>&deg;/s</td></tr>
+  <tr><td>4</td><td>gyro_z</td><td>&deg;/s</td></tr>
+  <tr><td>5</td><td>drift_score</td><td>0~1</td></tr>
+  <tr><td>6</td><td>Q1（当前生效值）</td><td>-</td></tr>
+  <tr><td>7</td><td>Q2（当前生效值）</td><td>-</td></tr>
+  <tr><td>8</td><td>R（当前生效值）</td><td>-</td></tr>
+  <tr><td>9</td><td>lambda（当前生效值）</td><td>-</td></tr>
+  <tr><td>10</td><td>ChiSquare</td><td>-</td></tr>
+  <tr><td>11</td><td>ChiSquare 阈值</td><td>-</td></tr>
+  <tr><td>12</td><td>dt（采样周期）</td><td>s</td></tr>
+  <tr><td>13</td><td>gz 零偏（已关闭 = 0）</td><td>&deg;/s</td></tr>
+  <tr><td>14</td><td>q1_base</td><td>-</td></tr>
+  <tr><td>15</td><td>q2_base</td><td>-</td></tr>
+  <tr><td>16</td><td>r（参数原始值）</td><td>-</td></tr>
+  <tr><td>17</td><td>lambda（参数原始值）</td><td>-</td></tr>
+  <tr><td>18</td><td>yaw_static_gz_dps</td><td>&deg;/s</td></tr>
+  <tr><td>19</td><td>yaw_drift_low_dps</td><td>&deg;/s</td></tr>
+  <tr><td>20</td><td>yaw_drift_high_dps</td><td>&deg;/s</td></tr>
+  <tr><td>21</td><td>score_rise_alpha</td><td>-</td></tr>
+  <tr><td>22</td><td>score_fall_alpha</td><td>-</td></tr>
+  <tr><td>23</td><td>q1_min_scale</td><td>-</td></tr>
+  <tr><td>24</td><td>q2_max_scale</td><td>-</td></tr>
+  <tr><td>25</td><td>r_max_scale</td><td>-</td></tr>
+  <tr><td>26</td><td>lambda_min</td><td>-</td></tr>
+  <tr><td>27</td><td>chi_thre_normal</td><td>-</td></tr>
+  <tr><td>28</td><td>chi_thre_strict</td><td>-</td></tr>
+  <tr><td>29</td><td>static_gyro_norm_dps</td><td>&deg;/s</td></tr>
+  <tr><td>30</td><td>static_accel_norm_tol</td><td>m/s&sup2;</td></tr>
+  <tr><td>31</td><td>gyro_z_bias_lpf_hz</td><td>Hz</td></tr>
+  <tr><td>32</td><td>gyro_z_bias_limit_dps</td><td>&deg;/s</td></tr>
+  <tr><td>33</td><td>adaptive_enable</td><td>0/1</td></tr>
+  <tr><td>34</td><td>chi_square_test_enable</td><td>0/1</td></tr>
+  <tr><td>35</td><td>上次错误码</td><td>见第5节</td></tr>
+</table>
+
+<h2>3. 发送参数（PC &rarr; STM32）</h2>
+<h3>3.1 帧格式</h3>
+<div class="frame-diagram">
+  [0xA5][0x5A][CMD][LEN_L][LEN_H][PAYLOAD...][CRC_L][CRC_H][0x5A][0xA5]
+</div>
+<table>
+  <tr><th>字段</th><th>长度</th><th>说明</th></tr>
+  <tr><td>帧头</td><td>2 B</td><td>固定 <code>0xA5 0x5A</code></td></tr>
+  <tr><td>CMD</td><td>1 B</td><td>命令字</td></tr>
+  <tr><td>LEN</td><td>2 B</td><td>Payload 字节数，little-endian</td></tr>
+  <tr><td>PAYLOAD</td><td>LEN B</td><td>参数数据</td></tr>
+  <tr><td>CRC16</td><td>2 B</td><td>little-endian，校验范围见下</td></tr>
+  <tr><td>帧尾</td><td>2 B</td><td>固定 <code>0x5A 0xA5</code></td></tr>
+</table>
+
+<div class="note">
+  <strong>CRC16 校验范围：</strong>CMD + LEN_L + LEN_H + PAYLOAD（不含帧头和帧尾）。<br>
+  算法：CRC-16（初始值 <code>0x0000</code>），具体查表实现参考工程中 <code>modules/algorithm/crc16.c</code>。
+</div>
+
+<h3>3.2 命令字定义</h3>
+<table>
+  <tr><th>CMD</th><th>名称</th><th>Payload 长度</th><th>说明</th></tr>
+  <tr><td><code>0x01</code></td><td>设置参数</td><td>78 B</td><td>下发全部参数，立即生效</td></tr>
+  <tr><td><code>0x02</code></td><td>查询参数</td><td>0 B</td><td>STM32 在下一帧 VOFA 中反映当前值</td></tr>
+</table>
+
+<h3>3.3 设置参数 Payload 结构（CMD = 0x01，共 78 字节）</h3>
+<table>
+  <tr><th>偏移</th><th>类型</th><th>字段</th><th>默认值</th></tr>
+  <tr><td>0</td><td>float</td><td>q1_base</td><td>9.0</td></tr>
+  <tr><td>4</td><td>float</td><td>q2_base</td><td>0.0010</td></tr>
+  <tr><td>8</td><td>float</td><td>r</td><td>1200000.0</td></tr>
+  <tr><td>12</td><td>float</td><td>lambda</td><td>0.9994</td></tr>
+  <tr><td>16</td><td>float</td><td>yaw_static_gz_dps</td><td>0.8</td></tr>
+  <tr><td>20</td><td>float</td><td>yaw_drift_low_dps</td><td>0.30</td></tr>
+  <tr><td>24</td><td>float</td><td>yaw_drift_high_dps</td><td>1.50</td></tr>
+  <tr><td>28</td><td>float</td><td>score_rise_alpha</td><td>0.08</td></tr>
+  <tr><td>32</td><td>float</td><td>score_fall_alpha</td><td>0.02</td></tr>
+  <tr><td>36</td><td>float</td><td>q1_min_scale</td><td>0.72</td></tr>
+  <tr><td>40</td><td>float</td><td>q2_max_scale</td><td>3.20</td></tr>
+  <tr><td>44</td><td>float</td><td>r_max_scale</td><td>1.60</td></tr>
+  <tr><td>48</td><td>float</td><td>lambda_min</td><td>0.9990</td></tr>
+  <tr><td>52</td><td>float</td><td>chi_thre_normal</td><td>0.0090</td></tr>
+  <tr><td>56</td><td>float</td><td>chi_thre_strict</td><td>0.0062</td></tr>
+  <tr><td>60</td><td>float</td><td>static_gyro_norm_dps</td><td>2.0</td></tr>
+  <tr><td>64</td><td>float</td><td>static_accel_norm_tol</td><td>0.50</td></tr>
+  <tr><td>68</td><td>float</td><td>gyro_z_bias_lpf_hz</td><td>0.05</td></tr>
+  <tr><td>72</td><td>float</td><td>gyro_z_bias_limit_dps</td><td>1.0</td></tr>
+  <tr><td>76</td><td>uint8</td><td>adaptive_enable</td><td>1</td></tr>
+  <tr><td>77</td><td>uint8</td><td>chi_square_test_enable</td><td>0</td></tr>
+</table>
+<p>所有 float 均为 <strong>little-endian</strong>（与 ARM Cortex-M 原生字节序一致）。</p>
+
+<h2>4. Python 发送示例</h2>
+<pre>
+import struct
+import serial
+
+# ---------- CRC-16 查表（与 STM32 端 crc16.c 一致）----------
+CRC16_TABLE = [
+    0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+    0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+    0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+    0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+    0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+    0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+    0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+    0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+    0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+    0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+    0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+    0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+    0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+    0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+    0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+    0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+    0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+    0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+    0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+    0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+    0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+    0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+    0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+    0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+    0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+    0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+    0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+    0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+    0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+    0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+    0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+    0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040,
+]
+
+def crc16(data: bytes) -> int:
+    crc = 0x0000
+    for b in data:
+        crc = (crc >> 8) ^ CRC16_TABLE[(crc ^ b) & 0xFF]
+    return crc
+
+def build_frame(cmd: int, payload: bytes = b'') -> bytes:
+    head = bytes([0xA5, 0x5A])
+    body = bytes([cmd]) + struct.pack('&lt;H', len(payload)) + payload
+    crc_val = crc16(body)
+    tail = bytes([0x5A, 0xA5])
+    return head + body + struct.pack('&lt;H', crc_val) + tail
+
+# -------------------- 使用示例 --------------------
+ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+
+# 构造默认参数
+params = struct.pack('&lt;19f2B',
+    9.0,        # q1_base
+    0.001,      # q2_base
+    1200000.0,  # r
+    0.9994,     # lambda
+    0.8,        # yaw_static_gz_dps
+    0.30,       # yaw_drift_low_dps
+    1.50,       # yaw_drift_high_dps
+    0.08,       # score_rise_alpha
+    0.02,       # score_fall_alpha
+    0.72,       # q1_min_scale
+    3.20,       # q2_max_scale
+    1.60,       # r_max_scale
+    0.9990,     # lambda_min
+    0.009,      # chi_thre_normal
+    0.0062,     # chi_thre_strict
+    2.0,        # static_gyro_norm_dps
+    0.50,       # static_accel_norm_tol
+    0.05,       # gyro_z_bias_lpf_hz
+    1.0,        # gyro_z_bias_limit_dps
+    1,          # adaptive_enable  (1=ON)
+    0,          # chi_square_test_enable (0=OFF)
+)
+
+# 发送设置参数命令
+ser.write(build_frame(0x01, params))
+print("参数已发送")
+
+# 发送查询参数命令
+ser.write(build_frame(0x02))
+print("查询命令已发送")
+</pre>
+
+<h2>5. 错误码（CH35）</h2>
+<table>
+  <tr><th>值</th><th>含义</th></tr>
+  <tr><td>0</td><td>无错误</td></tr>
+  <tr><td>1</td><td>Payload 长度不匹配（应为 78 字节）</td></tr>
+  <tr><td>2</td><td>参数值非法（sanitize 失败）</td></tr>
+  <tr><td>3</td><td>未知 CMD</td></tr>
+</table>
+
+<h2>6. 快速调参流程</h2>
+<ol>
+  <li>连接 UART6，打开 VOFA+ 选择 JustFloat 协议，确认能看到波形</li>
+  <li>观察 CH6~CH9（Q1/Q2/R/lambda 当前生效值）和 CH0（Yaw）</li>
+  <li>用 Python 脚本修改目标参数，通过 <code>CMD=0x01</code> 下发</li>
+  <li>观察 CH14~CH17 确认参数已更新，观察 CH35 确认错误码为 0</li>
+  <li>反复调整直到 Yaw 漂移和姿态响应满意</li>
+</ol>
+
+</body>
+</html>
