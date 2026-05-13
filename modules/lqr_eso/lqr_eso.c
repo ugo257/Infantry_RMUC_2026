@@ -612,6 +612,15 @@ void YawLQRESO_Reset(YawLQRESO_s *ctrl)
     g_alpha_ref_planned          = 0.0f;
     g_yaw_eso_tau_comp           = 0.0f;
     g_yaw_auto_eso_comp_active   = 0.0f;
+    ctrl->traj_latched_theta_rad      = 0.0f;
+    ctrl->traj_latched_omega_rad_s    = 0.0f;
+    ctrl->traj_latched_alpha_rad_s2   = 0.0f;
+    ctrl->traj_alpha_filt_rad_s2      = 0.0f;
+    ctrl->traj_dt_since_latch_s       = 0.0f;
+    ctrl->traj_last_input_theta_rad   = 0.0f;
+    ctrl->traj_last_input_omega_rad_s = 0.0f;
+    ctrl->traj_last_input_alpha_rad_s2 = 0.0f;
+    ctrl->traj_initialized            = 0U;
     YawPublishObserver(ctrl);
 }
 
