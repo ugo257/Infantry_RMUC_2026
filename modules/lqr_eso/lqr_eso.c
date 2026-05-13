@@ -452,6 +452,128 @@ static void RefPlanner_UpdateTrajectory(YawLQRESO_s *ctrl,
         LQRESOClampAbs(alpha_ref_rad_s2, REF_ALPHA_LIMIT_RAD_S2_DEFAULT);
 }
 
+static void RefPlanner_UpdateAutoAimTrajectory(YawLQRESO_s *ctrl,
+                                               float theta_in_rad,
+                                               float omega_in_rad_s,
+                                               float alpha_in_rad_s2,
+                                               float dt)
+{
+    float omega_limit;
+    float change_eps;
+    float rc;
+    float stale_timeout;
+    float decay_tau;
+    float lookahead_s;
+    float theta_out;
+    float omega_out;
+    float alpha_out;
+    uint8_t changed;
+
+    if (ctrl == NULL) {
+        return;
+    }
+
+    change_eps    = LQRESOAbs(g_traj_change_eps_rad);
+    rc            = (g_traj_alpha_lpf_rc_s > 0.0f) ? g_traj_alpha_lpf_rc_s : 0.0f;
+    stale_timeout = (g_traj_stale_timeout_s > 0.0f) ? g_traj_stale_timeout_s : 0.0f;
+    decay_tau     = (g_traj_decay_tau_s > 0.0f) ? g_traj_decay_tau_s : 1e-3f;
+    lookahead_s   = (g_traj_lookahead_s > 0.0f) ? g_traj_lookahead_s : 0.0f;
+    omega_limit   = LQRESOAbs(g_ref_omega_limit_rad_s);
+
+    /* (1) First entry: latch directly, prime LPF with input alpha. */
+    if (ctrl->traj_initialized == 0U) {
+        ctrl->traj_latched_theta_rad     = theta_in_rad;
+        ctrl->traj_latched_omega_rad_s   = omega_in_rad_s;
+        ctrl->traj_latched_alpha_rad_s2  = alpha_in_rad_s2;
+        ctrl->traj_alpha_filt_rad_s2     = alpha_in_rad_s2;
+        ctrl->traj_dt_since_latch_s      = 0.0f;
+        ctrl->traj_last_input_theta_rad  = theta_in_rad;
+        ctrl->traj_last_input_omega_rad_s = omega_in_rad_s;
+        ctrl->traj_last_input_alpha_rad_s2 = alpha_in_rad_s2;
+        ctrl->traj_initialized           = 1U;
+
+        theta_out = theta_in_rad;
+        omega_out = omega_in_rad_s;
+        alpha_out = alpha_in_rad_s2;
+    } else {
+        /* (2) Change detection vs last firmware tick. */
+        changed = (LQRESOAbs(theta_in_rad - ctrl->traj_last_input_theta_rad) > change_eps) ||
+                  (LQRESOAbs(omega_in_rad_s - ctrl->traj_last_input_omega_rad_s) > change_eps) ||
+                  (LQRESOAbs(alpha_in_rad_s2 - ctrl->traj_last_input_alpha_rad_s2) > change_eps);
+        ctrl->traj_last_input_theta_rad   = theta_in_rad;
+        ctrl->traj_last_input_omega_rad_s = omega_in_rad_s;
+        ctrl->traj_last_input_alpha_rad_s2 = alpha_in_rad_s2;
+
+        if (changed != 0U) {
+            /* (3a) New PC packet: snap (theta, omega), LPF on alpha (over inter-packet dt). */
+            const float dt_pkt = ctrl->traj_dt_since_latch_s;
+            const float beta_denom = rc + dt_pkt;
+            float beta;
+            if (beta_denom > 1e-9f) {
+                beta = dt_pkt / beta_denom;
+                if (beta < 0.0f) {
+                    beta = 0.0f;
+                }
+                if (beta > 1.0f) {
+                    beta = 1.0f;
+                }
+            } else {
+                beta = 0.0f;
+            }
+            ctrl->traj_alpha_filt_rad_s2 +=
+                beta * (alpha_in_rad_s2 - ctrl->traj_alpha_filt_rad_s2);
+            ctrl->traj_latched_theta_rad    = theta_in_rad;
+            ctrl->traj_latched_omega_rad_s  = omega_in_rad_s;
+            ctrl->traj_latched_alpha_rad_s2 = alpha_in_rad_s2;
+            ctrl->traj_dt_since_latch_s     = 0.0f;
+        } else {
+            /* (3b) No new packet: accumulate time. */
+            ctrl->traj_dt_since_latch_s += dt;
+        }
+
+        /* (4) Compute current output. */
+        {
+            const float tau = ctrl->traj_dt_since_latch_s;
+            const float w_l = ctrl->traj_latched_omega_rad_s;
+            const float a_f = ctrl->traj_alpha_filt_rad_s2;
+            const float th_l = ctrl->traj_latched_theta_rad;
+
+            if (stale_timeout > 0.0f && tau > stale_timeout) {
+                /* (4a) Staleness: freeze theta at stale entry; decay omega/alpha. */
+                const float d = stale_timeout;
+                const float theta_freeze = th_l + w_l * d + 0.5f * a_f * d * d;
+                const float omega_at_freeze = w_l + a_f * d;
+                const float decay = expf(-(tau - stale_timeout) / decay_tau);
+                theta_out = theta_freeze;
+                omega_out = omega_at_freeze * decay;
+                alpha_out = a_f * decay;
+            } else {
+                /* (4b) Normal constant-acceleration extrapolation. */
+                theta_out = th_l + w_l * tau + 0.5f * a_f * tau * tau;
+                omega_out = w_l + a_f * tau;
+                alpha_out = a_f;
+            }
+        }
+    }
+
+    /* (5) Optional lookahead. */
+    if (lookahead_s > 0.0f) {
+        const float L = lookahead_s;
+        theta_out += omega_out * L + 0.5f * alpha_out * L * L;
+        omega_out += alpha_out * L;
+    }
+
+    /* (6) Clamping (matches the legacy RefPlanner_UpdateTrajectory). */
+    if (omega_limit > 0.0f) {
+        omega_out = LQRESOClamp(omega_out, -omega_limit, omega_limit);
+    }
+    alpha_out = LQRESOClampAbs(alpha_out, REF_ALPHA_LIMIT_RAD_S2_DEFAULT);
+
+    ctrl->theta_ref_planned_rad = theta_out;
+    ctrl->omega_ref_planned     = omega_out;
+    ctrl->alpha_ref_planned     = alpha_out;
+}
+
 void YawLQRESO_Init(YawLQRESO_s *ctrl)
 {
     if (ctrl == NULL) {
