@@ -71,6 +71,16 @@ typedef struct
     float lqi_int;
     uint8_t feedback_ready;
     uint8_t limit_active;
+    /* Auto-aim trajectory extrapolation state */
+    float traj_latched_theta_rad;
+    float traj_latched_omega_rad_s;
+    float traj_latched_alpha_rad_s2;
+    float traj_alpha_filt_rad_s2;
+    float traj_dt_since_latch_s;
+    float traj_last_input_theta_rad;
+    float traj_last_input_omega_rad_s;
+    float traj_last_input_alpha_rad_s2;
+    uint8_t traj_initialized;
 } YawLQRESO_s;
 
 typedef struct
