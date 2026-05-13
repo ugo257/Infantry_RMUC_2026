@@ -702,11 +702,25 @@ void YawLQRESO_Calc(YawLQRESO_s *ctrl, const YawControlInput_t *input, float dt,
     ctrl->tau_meas_filt += alpha * (input->tau_meas_nm - ctrl->tau_meas_filt);
 
     if (input->ref_traj_valid != 0U) {
-        RefPlanner_UpdateTrajectory(ctrl,
-                                    theta_target_rad,
-                                    input->omega_ref_rad_s,
-                                    input->alpha_ref_rad_s2);
+        if (g_traj_planner_enable != 0U) {
+            RefPlanner_UpdateAutoAimTrajectory(ctrl,
+                                               theta_target_rad,
+                                               input->omega_ref_rad_s,
+                                               input->alpha_ref_rad_s2,
+                                               dt);
+        } else {
+            if (ctrl->traj_initialized != 0U) {
+                ctrl->traj_initialized = 0U;
+            }
+            RefPlanner_UpdateTrajectory(ctrl,
+                                        theta_target_rad,
+                                        input->omega_ref_rad_s,
+                                        input->alpha_ref_rad_s2);
+        }
     } else {
+        if (ctrl->traj_initialized != 0U) {
+            ctrl->traj_initialized = 0U;
+        }
         RefPlanner_Update(ctrl, theta_target_rad, dt);
     }
     theta_ref_rad = ctrl->theta_ref_planned_rad;
