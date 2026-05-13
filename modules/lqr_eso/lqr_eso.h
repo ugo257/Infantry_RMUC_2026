@@ -243,6 +243,13 @@ extern volatile float g_pitch_eso_z1;
 extern volatile float g_pitch_eso_z2;
 extern volatile float g_pitch_eso_z3;
 extern volatile float g_pitch_eso_tau_comp;
+/* Auto-aim trajectory planner tunables (live-watchable) */
+extern volatile uint8_t g_traj_planner_enable;
+extern volatile float g_traj_alpha_lpf_rc_s;
+extern volatile float g_traj_stale_timeout_s;
+extern volatile float g_traj_decay_tau_s;
+extern volatile float g_traj_lookahead_s;
+extern volatile float g_traj_change_eps_rad;
 
 void YawLQRESO_Init(YawLQRESO_s *ctrl);
 void YawLQRESO_Reset(YawLQRESO_s *ctrl);

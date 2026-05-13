@@ -74,6 +74,12 @@
 #define PITCH_STATE_LIMIT_ACTIVE            5U
 #define PITCH_STATE_REF                     6U
 #define PITCH_STATE_MEASURE                 7U
+#define TRAJ_PLANNER_ENABLE_DEFAULT         1U
+#define TRAJ_ALPHA_LPF_RC_DEFAULT           0.010f
+#define TRAJ_STALE_TIMEOUT_DEFAULT          0.050f
+#define TRAJ_DECAY_TAU_DEFAULT              0.030f
+#define TRAJ_LOOKAHEAD_DEFAULT              0.0f
+#define TRAJ_CHANGE_EPS_RAD_DEFAULT         1e-6f
 
 volatile float g_lqr_k_theta                 = LQR_K_THETA_DEFAULT;
 volatile float g_lqr_k_omega                 = LQR_K_OMEGA_DEFAULT;
@@ -137,6 +143,12 @@ volatile float g_pitch_eso_z1                = 0.0f;
 volatile float g_pitch_eso_z2                = 0.0f;
 volatile float g_pitch_eso_z3                = 0.0f;
 volatile float g_pitch_eso_tau_comp          = 0.0f;
+volatile uint8_t g_traj_planner_enable      = TRAJ_PLANNER_ENABLE_DEFAULT;
+volatile float g_traj_alpha_lpf_rc_s        = TRAJ_ALPHA_LPF_RC_DEFAULT;
+volatile float g_traj_stale_timeout_s       = TRAJ_STALE_TIMEOUT_DEFAULT;
+volatile float g_traj_decay_tau_s           = TRAJ_DECAY_TAU_DEFAULT;
+volatile float g_traj_lookahead_s           = TRAJ_LOOKAHEAD_DEFAULT;
+volatile float g_traj_change_eps_rad        = TRAJ_CHANGE_EPS_RAD_DEFAULT;
 
 static float LQRESOAbs(float value)
 {
