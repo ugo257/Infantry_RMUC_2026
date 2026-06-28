@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Fit single-wheel current to chassis acceleration/yaw response.
 
-The input CSVs are exported from g_chassis_force_calib_record. The script also
-accepts Ozone Live Watch CSV headers such as
-``(g_chassis_force_calib_record).body_acc_x`` and automatically strips that
-prefix.
+The input CSVs are exported from g_chassis_force_calib_record plus separately
+sampled chassis IMU columns. Ozone Live Watch prefixes such as
+``(g_chassis_force_calib_record).trial_id`` or ``((INS)->INS_data).INS_accel[0]``
+are stripped automatically. If g_chassis_force_calib_cmd is also exported, its
+fields are kept under a ``cmd.`` prefix so they do not overwrite record fields.
 
-One CSV may contain multiple current pulses. Pulses are split by consecutive
-rows whose pulse_state is 2 (active).
+One CSV may contain multiple current pulses. New firmware CSVs are split by
+trial_id and rows whose auto_state is PULSE_ACTIVE. Older CSVs with embedded IMU
+fields are still split by pulse_state == 2. The fit x-axis is always the
+controller command current, not measured motor current.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean
+from statistics import mean, pstdev
 
 
 T_WHEEL = {
@@ -30,6 +33,7 @@ T_WHEEL = {
 }
 
 WHEEL_NAME = {0: "LF", 1: "RF", 2: "RB", 3: "LB", 255: "ALL"}
+CURRENT_LEVELS_CMD = (2500, 3000, 3500, 4000, 4500)
 WHEEL_CURRENT_FIELD = {
     0: "real_current_fit_lf",
     1: "real_current_fit_rf",
@@ -43,18 +47,46 @@ WHEEL_SPEED_FIELD = {
     3: "wheel_speed_fit_lb",
 }
 
+AUTO_STATE_BASELINE = 2
+AUTO_STATE_PULSE_ACTIVE = 3
+AUTO_STATE_COAST_WAIT = 4
+AUTO_STATES_FOR_FIT = {AUTO_STATE_BASELINE, AUTO_STATE_PULSE_ACTIVE, AUTO_STATE_COAST_WAIT}
+
+RECORD_PREFIX = "(g_chassis_force_calib_record)."
+CMD_PREFIX = "(g_chassis_force_calib_cmd)."
+
+ACC_X_FIELDS = ("body_acc_x", "ax", "INS_accel[0]", "accel[0]")
+ACC_Y_FIELDS = ("body_acc_y", "ay", "INS_accel[1]", "accel[1]")
+ACC_Z_FIELDS = ("body_acc_z", "az", "INS_accel[2]", "accel[2]")
+GYRO_Z_FIELDS = ("body_omega_z", "omega_z", "wz", "INS_gyro[2]", "gyro[2]")
+CONTROL_CURRENT_FIELDS = ("applied_current_cmd_fit", "current_cmd_fit")
+ACC_X_TO_FORWARD_SIGN = -1.0
+ACC_Y_TO_LEFT_SIGN = -1.0
+GYRO_Z_TO_CCW_SIGN = 1.0
+
 
 @dataclass
 class PulseSegment:
     start: int
     end: int
+    trial_id: int = -1
 
 
 def normalize_header(name: str) -> str:
     name = name.strip()
+    if name.startswith(RECORD_PREFIX):
+        return name[len(RECORD_PREFIX):]
+    if name.startswith(CMD_PREFIX):
+        return "cmd." + name[len(CMD_PREFIX):]
     if name.startswith("(") and ")." in name:
         return name.split(").", 1)[1]
+    if "." in name:
+        return name.rsplit(".", 1)[1]
     return name
+
+
+def has_any(row: dict[str, str], *names: str) -> bool:
+    return any(name in row and row[name] != "" for name in names)
 
 
 def parse_float(row: dict[str, str], *names: str, default: float = 0.0) -> float:
@@ -74,6 +106,51 @@ def parse_int(row: dict[str, str], *names: str, default: int = 0) -> int:
 def mean_field(rows: list[dict[str, str]], *names: str) -> float:
     vals = [parse_float(row, *names) for row in rows]
     return mean(vals) if vals else 0.0
+
+
+def signed_field(row: dict[str, str], sign: float, *names: str) -> float:
+    return sign * parse_float(row, *names)
+
+
+def mean_signed_field(rows: list[dict[str, str]], sign: float, *names: str) -> float:
+    vals = [signed_field(row, sign, *names) for row in rows]
+    return mean(vals) if vals else 0.0
+
+
+def first_present_field(row: dict[str, str], *names: str) -> str:
+    for name in names:
+        if name in row and row[name] != "":
+            return name
+    return ""
+
+
+def row_usable_for_fit(row: dict[str, str]) -> bool:
+    if parse_int(row, "valid", default=1) == 0:
+        return False
+    if parse_int(row, "auto_abort", default=0) != 0:
+        return False
+    if parse_int(row, "hard_timeout", default=0) != 0:
+        return False
+    if "auto_state" in row:
+        return parse_int(row, "auto_state", default=0) in AUTO_STATES_FOR_FIT
+    return True
+
+
+def require_imu_fields(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        raise ValueError("empty CSV")
+    header_keys = set(rows[0].keys())
+    missing = []
+    for label, aliases in (
+        ("accel x", ACC_X_FIELDS),
+        ("accel y", ACC_Y_FIELDS),
+        ("accel z", ACC_Z_FIELDS),
+        ("gyro z", GYRO_Z_FIELDS),
+    ):
+        if not any(alias in header_keys for alias in aliases):
+            missing.append(f"{label}: one of {aliases}")
+    if missing:
+        raise ValueError("missing IMU columns; export chassis IMU separately. Missing " + "; ".join(missing))
 
 
 def slope_xy(xs: list[float], ys: list[float]) -> tuple[float, float]:
@@ -126,13 +203,34 @@ def row_time(row: dict[str, str], fallback_index: int) -> float:
 def find_active_segments(rows: list[dict[str, str]]) -> list[PulseSegment]:
     segments: list[PulseSegment] = []
     start: int | None = None
+    active_trial_id = -1
+    has_auto_state = any("auto_state" in row for row in rows)
+
+    if has_auto_state:
+        for index, row in enumerate(rows):
+            trial_id = parse_int(row, "trial_id", default=-1)
+            active = parse_int(row, "auto_state", default=0) == AUTO_STATE_PULSE_ACTIVE
+            if active and (start is None or trial_id != active_trial_id):
+                if start is not None:
+                    segments.append(PulseSegment(start, index - 1, active_trial_id))
+                start = index
+                active_trial_id = trial_id
+            elif (not active) and start is not None:
+                segments.append(PulseSegment(start, index - 1, active_trial_id))
+                start = None
+                active_trial_id = -1
+        if start is not None:
+            segments.append(PulseSegment(start, len(rows) - 1, active_trial_id))
+        return segments
+
     for index, row in enumerate(rows):
         active = parse_int(row, "pulse_state", default=0) == 2
         if active and start is None:
             start = index
         if (not active or index == len(rows) - 1) and start is not None:
             end = index if active else index - 1
-            segments.append(PulseSegment(start, end))
+            trial_id = parse_int(rows[start], "trial_id", default=len(segments))
+            segments.append(PulseSegment(start, end, trial_id))
             start = None
     return segments
 
@@ -157,10 +255,28 @@ def fit_segment(
     if trigger_time_s <= 0.0:
         trigger_time_s = row_time(segment_rows[0], segment.start)
 
-    baseline = [
-        row for index, row in enumerate(rows)
-        if baseline_window[0] <= relative_to_trigger(row, trigger_time_s, index) <= baseline_window[1]
-    ]
+    trial_id = parse_int(segment_rows[0], "trial_id", default=segment.trial_id)
+    has_auto_state = "auto_state" in segment_rows[0]
+    if has_auto_state:
+        same_trial = [row for row in rows if parse_int(row, "trial_id", default=-1) == trial_id]
+        baseline_by_state = [
+            row for row in same_trial
+            if parse_int(row, "auto_state", default=0) == AUTO_STATE_BASELINE
+        ]
+        baseline = baseline_by_state if baseline_by_state else [
+            row for index, row in enumerate(rows)
+            if baseline_window[0] <= relative_to_trigger(row, trigger_time_s, index) <= baseline_window[1]
+        ]
+        coast_samples = sum(
+            1 for row in same_trial
+            if parse_int(row, "auto_state", default=0) == AUTO_STATE_COAST_WAIT
+        )
+    else:
+        baseline = [
+            row for index, row in enumerate(rows)
+            if baseline_window[0] <= relative_to_trigger(row, trigger_time_s, index) <= baseline_window[1]
+        ]
+        coast_samples = 0
     active = [
         (row, relative_to_trigger(row, trigger_time_s, segment.start + offset))
         for offset, row in enumerate(segment_rows)
@@ -170,17 +286,20 @@ def fit_segment(
     if len(baseline) < 10 or len(active) < 10:
         raise ValueError("not enough samples in baseline or active window")
 
-    base_ax = mean_field(baseline, "body_acc_x", "ax")
-    base_ay = mean_field(baseline, "body_acc_y", "ay")
-    base_az = mean_field(baseline, "body_acc_z", "az")
-    base_wz = mean_field(baseline, "body_omega_z", "omega_z", "wz")
+    base_ax = mean_signed_field(baseline, ACC_X_TO_FORWARD_SIGN, *ACC_X_FIELDS)
+    base_ay = mean_signed_field(baseline, ACC_Y_TO_LEFT_SIGN, *ACC_Y_FIELDS)
+    base_az = mean_field(baseline, *ACC_Z_FIELDS)
+    base_wz = mean_signed_field(baseline, GYRO_Z_TO_CCW_SIGN, *GYRO_Z_FIELDS)
 
     active_t = [t for _, t in active]
-    active_wz = [parse_float(row, "body_omega_z", "omega_z", "wz") - base_wz for row, _ in active]
+    active_wz = [signed_field(row, GYRO_Z_TO_CCW_SIGN, *GYRO_Z_FIELDS) - base_wz for row, _ in active]
     alpha_z, _ = slope_xy(active_t, active_wz)
 
     active_rows = [row for row, _ in active]
-    active_cmds = [parse_float(row, "current_cmd_fit", "I") for row in active_rows]
+    fit_current_source = first_present_field(active_rows[0], *CONTROL_CURRENT_FIELDS)
+    if fit_current_source == "":
+        raise ValueError("missing controller current command field for fit")
+    active_cmds = [parse_float(row, *CONTROL_CURRENT_FIELDS) for row in active_rows]
     active_wheels = [parse_int(row, "wheel_index", default=255) for row in active_rows]
     current_cmd = mean(active_cmds)
     wheel_index = round(mean(active_wheels))
@@ -189,8 +308,8 @@ def fit_segment(
     corr_ax: list[float] = []
     corr_ay: list[float] = []
     for row, wz in zip(active_rows, active_wz):
-        ax = parse_float(row, "body_acc_x", "ax") - base_ax
-        ay = parse_float(row, "body_acc_y", "ay") - base_ay
+        ax = signed_field(row, ACC_X_TO_FORWARD_SIGN, *ACC_X_FIELDS) - base_ax
+        ay = signed_field(row, ACC_Y_TO_LEFT_SIGN, *ACC_Y_FIELDS) - base_ay
         corr_ax.append(ax + alpha_z * imu_ry_m + wz * wz * imu_rx_m)
         corr_ay.append(ay - alpha_z * imu_rx_m + wz * wz * imu_ry_m)
 
@@ -202,7 +321,10 @@ def fit_segment(
 
     current_field = WHEEL_CURRENT_FIELD.get(wheel_index, "")
     speed_field = WHEEL_SPEED_FIELD.get(wheel_index, "")
-    real_current = mean_field(active_rows, current_field) if current_field else 0.0
+    real_current = (
+        mean_field(active_rows, "real_current_selected", current_field)
+        if current_field else mean_field(active_rows, "real_current_selected")
+    )
     wheel_speed = mean_field(active_rows, speed_field) if speed_field else 0.0
     pulse_elapsed = [parse_float(row, "pulse_elapsed_s") for row in segment_rows]
     pulse_duration_s = max(pulse_elapsed) - min(pulse_elapsed) if pulse_elapsed else 0.0
@@ -210,9 +332,15 @@ def fit_segment(
     return {
         "file": str(path),
         "pulse_index": pulse_index,
+        "trial_id": trial_id,
         "wheel_index": wheel_index,
         "wheel": WHEEL_NAME.get(wheel_index, str(wheel_index)),
         "sign": "pos" if current_cmd >= 0.0 else "neg",
+        "current_level_index": parse_int(segment_rows[0], "current_level_index", default=-1),
+        "repeat_index": parse_int(segment_rows[0], "repeat_index", default=pulse_index),
+        "current_abs_cmd_level": current_level_cmd(parse_int(segment_rows[0], "current_level_index", default=-1),
+                                                   current_cmd),
+        "fit_current_source": fit_current_source,
         "current_cmd": current_cmd,
         "real_current": real_current,
         "real_current_per_cmd": real_current / cmd_abs,
@@ -223,6 +351,7 @@ def fit_segment(
         "valid": all(parse_int(row, "valid", default=0) != 0 for row in segment_rows),
         "baseline_samples": len(baseline),
         "active_samples": len(active),
+        "coast_samples": coast_samples,
         "baseline_acc_z": base_az,
         "base_omega_z": base_wz,
         "a_com_x": delta_a_com_x,
@@ -250,10 +379,12 @@ def fit_file(
     rows = read_csv(path)
     if not rows:
         raise ValueError("empty CSV")
+    require_imu_fields(rows)
 
-    segments = find_active_segments(rows)
+    fit_rows = [row for row in rows if row_usable_for_fit(row)]
+    segments = find_active_segments(fit_rows)
     if not segments:
-        raise ValueError("no active pulse_state==2 segments")
+        raise ValueError("no active auto_state==PULSE_ACTIVE or pulse_state==2 segments")
 
     trials: list[dict[str, float | int | str | bool]] = []
     errors = 0
@@ -262,7 +393,7 @@ def fit_file(
             trials.append(
                 fit_segment(
                     path,
-                    rows,
+                    fit_rows,
                     segment,
                     pulse_index,
                     mass_kg,
@@ -278,9 +409,14 @@ def fit_file(
     wheel_indices = [parse_int(row, "wheel_index", default=255) for row in rows]
     valid_count = sum(1 for row in rows if parse_int(row, "valid", default=0) != 0)
     hard_timeout_count = sum(1 for row in rows if parse_int(row, "hard_timeout", default=0) != 0)
+    segment_trial_ids = sorted({parse_int(fit_rows[segment.start], "trial_id", default=-1)
+                                for segment in segments})
+    fitted_wheels = sorted({int(trial["wheel_index"]) for trial in trials})
     summary = {
         "file": str(path),
         "rows": len(rows),
+        "usable_rows": len(fit_rows),
+        "filtered_rows": len(rows) - len(fit_rows),
         "wheel_index": round(mean(wheel_indices)) if wheel_indices else 255,
         "wheel": WHEEL_NAME.get(round(mean(wheel_indices)) if wheel_indices else 255, "UNKNOWN"),
         "pulse_segments": len(segments),
@@ -288,6 +424,10 @@ def fit_file(
         "skipped_pulses": errors,
         "valid_ratio": valid_count / len(rows),
         "hard_timeout_count": hard_timeout_count,
+        "active_trial_ids": segment_trial_ids,
+        "active_trial_count": len(segment_trial_ids),
+        "fitted_wheels": fitted_wheels,
+        "single_wheel_csv_complete": len(segment_trial_ids) == 20 and len(fitted_wheels) == 1,
     }
     return trials, summary
 
@@ -295,14 +435,14 @@ def fit_file(
 def fit_groups(
     trials: list[dict[str, float | int | str | bool]],
     fit_min_abs_cmd: float,
-) -> dict[str, dict[str, float | int | list[int] | str | bool]]:
+) -> dict[str, dict[str, object]]:
     groups: dict[str, list[dict[str, float | int | str | bool]]] = {}
     for trial in trials:
         wheel = str(trial["wheel"])
         sign = str(trial["sign"])
         groups.setdefault(f"{wheel}_{sign}", []).append(trial)
 
-    out: dict[str, dict[str, float | int | list[int] | str | bool]] = {}
+    out: dict[str, dict[str, object]] = {}
     for key, items_all in groups.items():
         items = [item for item in items_all if abs(float(item["current_cmd"])) >= fit_min_abs_cmd]
         if len(items) < 2:
@@ -318,6 +458,24 @@ def fit_groups(
         a_pred = [a_slope * current + a_intercept for current in currents]
         force_pred = [force_slope * current + force_intercept for current in currents]
         deadzone_cmd = -a_intercept / a_slope if abs(a_slope) > 1.0e-12 else 0.0
+        repeat_consistency: dict[str, dict[str, float | int]] = {}
+        current_bins = sorted({int(item["current_abs_cmd_level"]) for item in items_all})
+        for current_bin in current_bins:
+            bin_forces = [
+                float(item["force_parallel_n"])
+                for item in items_all
+                if int(item["current_abs_cmd_level"]) == current_bin
+            ]
+            if not bin_forces:
+                continue
+            force_mean = mean(bin_forces)
+            force_std = pstdev(bin_forces) if len(bin_forces) > 1 else 0.0
+            repeat_consistency[str(current_bin)] = {
+                "n": len(bin_forces),
+                "force_mean_n": force_mean,
+                "force_std_n": force_std,
+                "force_cv": force_std / abs(force_mean) if abs(force_mean) > 1.0e-6 else 0.0,
+            }
 
         out[key] = {
             "wheel": str(items[0]["wheel"]),
@@ -338,11 +496,12 @@ def fit_groups(
             "deadzone_abs_cmd_est": abs(deadzone_cmd),
             "rmse_a_parallel_mps2": rms([pred - actual for pred, actual in zip(a_pred, a_parallel)]),
             "rmse_force_n": rms([pred - actual for pred, actual in zip(force_pred, force)]),
+            "repeat_force_consistency_by_abs_cmd": repeat_consistency,
         }
     return out
 
 
-def build_recommended_table(groups: dict[str, dict[str, float | int | list[int] | str | bool]]) -> list[dict[str, float | int | str]]:
+def build_recommended_table(groups: dict[str, dict[str, object]]) -> list[dict[str, float | int | str]]:
     rows: list[dict[str, float | int | str]] = []
     for wheel_index in range(4):
         wheel = WHEEL_NAME[wheel_index]
@@ -363,6 +522,58 @@ def build_recommended_table(groups: dict[str, dict[str, float | int | list[int] 
                 }
             )
     return rows
+
+
+def current_level_cmd(level_index: int, current_cmd: float) -> int:
+    if 0 <= level_index < len(CURRENT_LEVELS_CMD):
+        return CURRENT_LEVELS_CMD[level_index]
+    return round(abs(current_cmd))
+
+
+def build_coverage_report(trials: list[dict[str, float | int | str | bool]]) -> dict[str, object]:
+    points: dict[str, int] = {}
+    missing: list[dict[str, int | str]] = []
+
+    for wheel_index in range(4):
+        wheel = WHEEL_NAME[wheel_index]
+        for sign in ("pos", "neg"):
+            for level_index, level in enumerate(CURRENT_LEVELS_CMD):
+                repeats = {
+                    int(trial["repeat_index"])
+                    for trial in trials
+                    if int(trial["wheel_index"]) == wheel_index and
+                    str(trial["sign"]) == sign and
+                    int(trial["current_level_index"]) == level_index
+                }
+                if not repeats:
+                    repeats = {
+                        index for index, trial in enumerate(trials)
+                        if int(trial["wheel_index"]) == wheel_index and
+                        str(trial["sign"]) == sign and
+                        int(trial["current_abs_cmd_level"]) == level
+                    }
+                count = len(repeats)
+                key = f"{wheel}_{sign}_{level}"
+                points[key] = count
+                if count < 2:
+                    missing.append(
+                        {
+                            "wheel_index": wheel_index,
+                            "wheel": wheel,
+                            "sign": sign,
+                            "current_abs_cmd": level,
+                            "repeats_found": count,
+                            "repeats_expected": 2,
+                        }
+                    )
+
+    return {
+        "expected_repeats_per_point": 2,
+        "expected_points": 4 * 2 * len(CURRENT_LEVELS_CMD),
+        "points": points,
+        "missing_points": missing,
+        "complete": len(missing) == 0,
+    }
 
 
 def main() -> int:
@@ -407,7 +618,9 @@ def main() -> int:
             "x": "forward positive",
             "y": "left positive",
             "yaw": "counter-clockwise positive",
+            "exported_accel_sign": "ax_forward=-INS_accel[0], ay_left=-INS_accel[1], wz_ccw=INS_gyro[2]",
         },
+        "fit_current_source_priority": list(CONTROL_CURRENT_FIELDS),
         "baseline_window_s": list(args.baseline),
         "active_window_s": list(args.active),
         "fit_min_abs_cmd": args.fit_min_abs_cmd,
@@ -416,6 +629,7 @@ def main() -> int:
         "trials": trials,
         "groups": groups,
         "recommended_table": build_recommended_table(groups),
+        "coverage": build_coverage_report(trials),
         "errors": errors,
     }
 
@@ -428,6 +642,9 @@ def main() -> int:
             f"cmd/N={row['cmd_per_n']:.1f}, "
             f"deadzone={row['deadzone_abs_cmd_est']:.0f}"
         )
+    coverage = result["coverage"]
+    if not coverage["complete"]:
+        print(f"coverage incomplete: {len(coverage['missing_points'])} missing wheel/sign/current repeat groups")
     return 0 if trials else 1
 
 

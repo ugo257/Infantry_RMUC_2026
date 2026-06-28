@@ -26,7 +26,7 @@ typedef struct
     uint16_t CmdID;
     ext_student_interactive_header_data_t datahead;
     uint16_t frametail;
-} UI_GraphReFresh_t;
+} UI_GraphReFresh_t; // 图形刷新帧头，后续图形数据按0x0101的15字节结构拼接
 
 typedef struct
 {
@@ -67,6 +67,7 @@ void UIIntDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, u
 void UICharDraw(String_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                 uint32_t Graph_Size, uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y,const char *fmt, ...);
 
+/* 按协议只能一次推送1/2/5/7个图形，分别对应子内容ID 0x0101/0x0102/0x0103/0x0104。 */
 void UIGraphRefresh(referee_id_t *_id, int cnt, ...);
 
 void UICharRefresh(referee_id_t *_id, String_Data_t string_Data);

@@ -14,13 +14,32 @@
 #define OMNI_CURRENT_OFFSET_FORCE_DEADBAND_N 1.0f
 #define OMNI_MULTI_SLIP_AVG_START 0.25f
 #define OMNI_MULTI_SLIP_AVG_FULL 0.75f
-#define OMNI_MULTI_SLIP_MIN_WRENCH_SCALE 0.30f
+#define OMNI_MULTI_SLIP_MIN_WRENCH_SCALE 1.0f//0.70f
 #define OMNI_MULTI_SLIP_MAX_TRIGGER 0.90f
 #define OMNI_MULTI_SLIP_AVG_TRIGGER 0.45f
 #define OMNI_SLIP_RECOVERY_ALPHA 0.20f
 #define OMNI_SLIP_RECOVERY_CMD_EPS 1.0f
 #define OMNI_SLIP_RECOVERY_FORCE_EPS_N 2.0f
 #define OMNI_SLIP_RECOVERY_CURRENT_EPS_CMD 800.0f
+#define OMNI_POWER_SCALE_BISECT_STEPS 4U
+#define OMNI_POWER_SCALE_EPS 1.0e-5f
+#define OMNI_POWER_FEEDBACK_DEFAULT_DEADBAND_W 8.0f
+#define OMNI_POWER_FEEDBACK_DEFAULT_SCALE_MIN 0.55f
+#define OMNI_POWER_FEEDBACK_DEFAULT_DOWN_ALPHA 0.015f
+#define OMNI_POWER_FEEDBACK_DEFAULT_UP_ALPHA 0.006f
+#define OMNI_POWER_FEEDBACK_DEFAULT_LPF_TAU_S 0.050f
+#define OMNI_POWER_FEEDBACK_DEFAULT_LOCAL_MIN_RATIO 0.25f
+#define OMNI_POWER_BUDGET_MARGIN_DEFAULT 0.92f
+#define OMNI_POWER_WHEEL_SPEED_LIMIT_DEFAULT 3000.0f
+#define OMNI_ROTATE_SEARCH_SCALE_MAX 100000.0f
+#define OMNI_ROTATE_VXY_ACTIVE_EPS 1.0f
+#define OMNI_REACHABLE_BUDGET_REL_TOL 0.05f
+#define OMNI_REACHABLE_BUDGET_ABS_TOL_W 1.0f
+#define OMNI_REACHABLE_DIR_DOT_MIN 0.9659258f
+#define OMNI_IDEAL_CMD_TO_MPS 6.8e-5f
+#define OMNI_IDEAL_CMD_TO_RADPS 1.3e-3f
+#define OMNI_AW_WRENCH_ERR_TH_VXY_N 0.5f
+#define OMNI_AW_WRENCH_ERR_TH_WZ_NM 0.05f
 
 static float OmniAbs(float value)
 {
@@ -119,26 +138,35 @@ static void OmniUpdateCommandToSiScale(OmniVelocityCtrl_s *ctrl)
 static void OmniBuildMatrix(OmniVelocityCtrl_s *ctrl)
 {
     /*
-     * 根据 chassis_reH.csv 遥控数据直接命令单位拟合得到的普通 X 型 omni 轮端速度矩阵。
+     * 普通 X 型 omni 理想速度矩阵。
      * 输入坐标为 vx 前向、vy 左向、wz 逆时针为正；轮序固定为 LF/RF/RB/LB。
      * DJI 电机反馈和参考仍是电机轴单位，底盘层用 268/17 减速比换算到轮端单位。
      * wheel_dir 只修正电机安装方向，不负责减速比换算。
      */
-    ctrl->h[OMNI_WHEEL_LF][OMNI_AXIS_VX] = 0.0347094147f;
-    ctrl->h[OMNI_WHEEL_LF][OMNI_AXIS_VY] = -0.0361355412f;
-    ctrl->h[OMNI_WHEEL_LF][OMNI_AXIS_WZ] = -0.267720510f;
+    const float wheel_radius_m = OmniWheelRadiusM();
+    const float yaw_lever_m = OmniYawLeverM(ctrl);
+    const float wheel_radps_to_degps =
+        (wheel_radius_m > 1.0e-6f) ? (1.0f / (DEGREE_2_RAD * wheel_radius_m)) : 0.0f;
+    const float vxy_coeff =
+        OMNI_ROLLING_DIR_Q * OMNI_IDEAL_CMD_TO_MPS * wheel_radps_to_degps;
+    const float wz_coeff =
+        yaw_lever_m * OMNI_IDEAL_CMD_TO_RADPS * wheel_radps_to_degps;
 
-    ctrl->h[OMNI_WHEEL_RF][OMNI_AXIS_VX] = 0.0358944042f;
-    ctrl->h[OMNI_WHEEL_RF][OMNI_AXIS_VY] = 0.0368013157f;
-    ctrl->h[OMNI_WHEEL_RF][OMNI_AXIS_WZ] = 0.266192090f;
+    ctrl->h[OMNI_WHEEL_LF][OMNI_AXIS_VX] = vxy_coeff;
+    ctrl->h[OMNI_WHEEL_LF][OMNI_AXIS_VY] = -vxy_coeff;
+    ctrl->h[OMNI_WHEEL_LF][OMNI_AXIS_WZ] = -wz_coeff;
 
-    ctrl->h[OMNI_WHEEL_RB][OMNI_AXIS_VX] = 0.0351562327f;
-    ctrl->h[OMNI_WHEEL_RB][OMNI_AXIS_VY] = -0.0351616775f;
-    ctrl->h[OMNI_WHEEL_RB][OMNI_AXIS_WZ] = 0.262277860f;
+    ctrl->h[OMNI_WHEEL_RF][OMNI_AXIS_VX] = vxy_coeff;
+    ctrl->h[OMNI_WHEEL_RF][OMNI_AXIS_VY] = vxy_coeff;
+    ctrl->h[OMNI_WHEEL_RF][OMNI_AXIS_WZ] = wz_coeff;
 
-    ctrl->h[OMNI_WHEEL_LB][OMNI_AXIS_VX] = 0.0358132523f;
-    ctrl->h[OMNI_WHEEL_LB][OMNI_AXIS_VY] = 0.0357837394f;
-    ctrl->h[OMNI_WHEEL_LB][OMNI_AXIS_WZ] = -0.264667993f;
+    ctrl->h[OMNI_WHEEL_RB][OMNI_AXIS_VX] = vxy_coeff;
+    ctrl->h[OMNI_WHEEL_RB][OMNI_AXIS_VY] = -vxy_coeff;
+    ctrl->h[OMNI_WHEEL_RB][OMNI_AXIS_WZ] = wz_coeff;
+
+    ctrl->h[OMNI_WHEEL_LB][OMNI_AXIS_VX] = vxy_coeff;
+    ctrl->h[OMNI_WHEEL_LB][OMNI_AXIS_VY] = vxy_coeff;
+    ctrl->h[OMNI_WHEEL_LB][OMNI_AXIS_WZ] = -wz_coeff;
 
     OmniBuildPhysicalForceMatrix(ctrl);
     OmniUpdateCommandToSiScale(ctrl);
@@ -326,6 +354,22 @@ static uint8_t OmniIsEsoCompStaticBlocked(const OmniVelocityCtrl_s *ctrl, uint8_
             OmniAbs(ctrl->lqi_feedback[axis]) < deadband) ? 1U : 0U;
 }
 
+static uint8_t OmniShouldFreezeIntegral(const OmniVelocityCtrl_s *ctrl,
+                                        uint8_t axis,
+                                        float err)
+{
+    const float wrench_err =
+        ctrl->wrench_des_prev[axis] - ctrl->wrench_act_prev[axis];
+    const float threshold = (axis == OMNI_AXIS_WZ) ?
+        OMNI_AW_WRENCH_ERR_TH_WZ_NM : OMNI_AW_WRENCH_ERR_TH_VXY_N;
+
+    if (OmniAbs(wrench_err) <= threshold) {
+        return 0U;
+    }
+
+    return (err * wrench_err > 0.0f) ? 1U : 0U;
+}
+
 static void OmniCalcDesiredWrench(OmniVelocityCtrl_s *ctrl, float dt)
 {
     for (uint8_t i = 0; i < OMNI_AXIS_NUM; ++i) {
@@ -335,7 +379,9 @@ static void OmniCalcDesiredWrench(OmniVelocityCtrl_s *ctrl, float dt)
 
         ctrl->lqi_error[i] = err;
         if (OmniAbs(ctrl->config.ki[i]) > 1.0e-6f) {
-            ctrl->integral[i] += err * dt;
+            if (OmniShouldFreezeIntegral(ctrl, i, err) == 0U) {
+                ctrl->integral[i] += err * dt;
+            }
             ctrl->integral[i] = OmniClampAbs(ctrl->integral[i], ctrl->config.integral_limit[i]);
         } else {
             ctrl->integral[i] = 0.0f;
@@ -352,6 +398,18 @@ static void OmniCalcDesiredWrench(OmniVelocityCtrl_s *ctrl, float dt)
                               dist_comp;
         ctrl->wrench_des_prev[i] = mass * acc_cmd +
                                    ctrl->config.damping[i] * ctrl->lqi_feedback[i];
+    }
+}
+
+static void OmniApplyExternalWrenchFeedforward(OmniVelocityCtrl_s *ctrl,
+                                               const OmniVelocityCtrlInput_s *input)
+{
+    for (uint8_t i = 0; i < OMNI_AXIS_NUM; ++i) {
+        const float ff = input->external_wrench_ff[i];
+
+        if (isfinite(ff) != 0) {
+            ctrl->wrench_des_prev[i] += ff;
+        }
     }
 }
 
@@ -390,7 +448,7 @@ static void OmniApplyMultiSlipWrenchDerate(OmniVelocityCtrl_s *ctrl)
 
 static float OmniGetSlipForceWeight(const OmniVelocityCtrl_s *ctrl, uint8_t wheel);
 
-static void OmniSolveFreeForces(OmniVelocityCtrl_s *ctrl,
+static void OmniSolveFreeForces(const OmniVelocityCtrl_s *ctrl,
                                 const uint8_t free_mask[OMNI_WHEEL_NUM],
                                 const float wrench_rem[OMNI_AXIS_NUM],
                                 float force[OMNI_WHEEL_NUM])
@@ -442,7 +500,7 @@ static float OmniGetSlipForceWeight(const OmniVelocityCtrl_s *ctrl, uint8_t whee
         return 1.0f;
     }
     if (slip_prob >= 1.0f) {
-        return 0.0f;
+        return min_weight;
     }
     return OmniClamp(weight, min_weight, 1.0f);
 }
@@ -500,11 +558,15 @@ static void OmniBuildForceBounds(const OmniVelocityCtrl_s *ctrl,
                                  float force_min[OMNI_WHEEL_NUM],
                                  float force_max[OMNI_WHEEL_NUM])
 {
+    const float dt = OmniSanitizeDt(ctrl, input->dt);
+    const float rate_limit = input->current_rate_limit;
+
     for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
         float current_limit = input->current_limit;
         float pos_k = ctrl->config.force_to_cmd_pos[wheel];
         float neg_k = ctrl->config.force_to_cmd_neg[wheel];
-        float usable_current;
+        float current_min;
+        float current_max;
 
         if (current_limit <= 0.0f) {
             current_limit = ctrl->config.wheel_current_limit[wheel];
@@ -519,23 +581,49 @@ static void OmniBuildForceBounds(const OmniVelocityCtrl_s *ctrl,
             neg_k = pos_k;
         }
 
-        usable_current = OmniAbs(current_limit);
-        if (input->current_offset_enable != 0U) {
-            usable_current -= OmniAbs(ctrl->config.current_offset[wheel]);
-            if (usable_current < 0.0f) {
-                usable_current = 0.0f;
+        current_min = -OmniAbs(current_limit);
+        current_max = OmniAbs(current_limit);
+        if (rate_limit > 0.0f) {
+            const float max_delta = OmniAbs(rate_limit) * dt;
+            const float current_prev = ctrl->current_ref_fit_prev[wheel];
+            const float rate_min = current_prev - max_delta;
+            const float rate_max = current_prev + max_delta;
+
+            if (rate_min > current_min) {
+                current_min = rate_min;
+            }
+            if (rate_max < current_max) {
+                current_max = rate_max;
+            }
+            if (current_min > current_max) {
+                const float current_target =
+                    OmniClamp(current_prev, -OmniAbs(current_limit), OmniAbs(current_limit));
+                current_min = current_target;
+                current_max = current_target;
             }
         }
 
-        force_max[wheel] = usable_current / pos_k;
-        force_min[wheel] = -usable_current / neg_k;
+        force_min[wheel] = OmniCurrentFitToForce(ctrl,
+                                                 wheel,
+                                                 current_min,
+                                                 input->current_offset_enable);
+        force_max[wheel] = OmniCurrentFitToForce(ctrl,
+                                                 wheel,
+                                                 current_max,
+                                                 input->current_offset_enable);
+        if (force_min[wheel] > force_max[wheel]) {
+            const float tmp = force_min[wheel];
+            force_min[wheel] = force_max[wheel];
+            force_max[wheel] = tmp;
+        }
     }
 }
 
-static void OmniAllocateForce(OmniVelocityCtrl_s *ctrl,
-                              const OmniVelocityCtrlInput_s *input,
-                              float force_cmd[OMNI_WHEEL_NUM],
-                              uint8_t *limit_active)
+static void OmniAllocateForceForWrench(const OmniVelocityCtrl_s *ctrl,
+                                       const OmniVelocityCtrlInput_s *input,
+                                       const float wrench_des[OMNI_AXIS_NUM],
+                                       float force_cmd[OMNI_WHEEL_NUM],
+                                       uint8_t *limit_active)
 {
     uint8_t free_mask[OMNI_WHEEL_NUM] = {1U, 1U, 1U, 1U};
     float force_min[OMNI_WHEEL_NUM];
@@ -553,7 +641,7 @@ static void OmniAllocateForce(OmniVelocityCtrl_s *ctrl,
         float clamp_value = 0.0f;
 
         for (uint8_t axis = 0; axis < OMNI_AXIS_NUM; ++axis) {
-            wrench_rem[axis] = ctrl->wrench_des_prev[axis];
+            wrench_rem[axis] = wrench_des[axis];
             for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
                 if (free_mask[wheel] == 0U) {
                     wrench_rem[axis] -= ctrl->force_h[wheel][axis] * force_cmd[wheel];
@@ -598,6 +686,863 @@ static void OmniAllocateForce(OmniVelocityCtrl_s *ctrl,
     }
 }
 
+static void OmniAllocateForce(const OmniVelocityCtrl_s *ctrl,
+                              const OmniVelocityCtrlInput_s *input,
+                              float force_cmd[OMNI_WHEEL_NUM],
+                              uint8_t *limit_active)
+{
+    OmniAllocateForceForWrench(ctrl, input, ctrl->wrench_des_prev, force_cmd, limit_active);
+}
+
+static uint8_t OmniIsEsoCompStaticBlockedForRef(const OmniVelocityCtrl_s *ctrl,
+                                                uint8_t axis,
+                                                float lqi_ref)
+{
+    const float deadband = (axis == OMNI_AXIS_WZ) ?
+        ctrl->config.eso_comp_static_deadband_wz :
+        ctrl->config.eso_comp_static_deadband_v;
+
+    if (deadband <= 0.0f) {
+        return 0U;
+    }
+    return (OmniAbs(lqi_ref) < deadband &&
+            OmniAbs(ctrl->lqi_feedback[axis]) < deadband) ? 1U : 0U;
+}
+
+static void OmniPredictWrenchForRef(const OmniVelocityCtrl_s *ctrl,
+                                    const OmniVelocityCtrlInput_s *input,
+                                    const float ref[OMNI_AXIS_NUM],
+                                    const float ref_dot[OMNI_AXIS_NUM],
+                                    float wrench[OMNI_AXIS_NUM])
+{
+    for (uint8_t axis = 0; axis < OMNI_AXIS_NUM; ++axis) {
+        const float lqi_ref = ref[axis] * ctrl->cmd_to_si[axis];
+        const float lqi_ref_dot = ref_dot[axis] * ctrl->cmd_to_si[axis];
+        const float err = lqi_ref - ctrl->lqi_feedback[axis];
+        const float mass = (OmniAbs(ctrl->config.mass[axis]) > 1.0e-6f) ?
+            ctrl->config.mass[axis] : 1.0f;
+        float dist_comp = (ctrl->config.eso_compensate_enable != 0U) ?
+            ctrl->config.eso_compensate_gain[axis] * ctrl->dist_hat[axis] : 0.0f;
+        const float ff = input->external_wrench_ff[axis];
+
+        if (OmniIsEsoCompStaticBlockedForRef(ctrl, axis, lqi_ref) != 0U) {
+            dist_comp = 0.0f;
+        }
+
+        const float acc_cmd = lqi_ref_dot +
+                              ctrl->config.kp[axis] * err +
+                              ctrl->config.ki[axis] * ctrl->integral[axis] -
+                              dist_comp;
+        wrench[axis] = mass * acc_cmd +
+                       ctrl->config.damping[axis] * ctrl->lqi_feedback[axis];
+        if (isfinite(ff) != 0) {
+            wrench[axis] += ff;
+        }
+    }
+}
+
+static void OmniBuildWheelSpeedFitForRef(const OmniVelocityCtrl_s *ctrl,
+                                         const float ref[OMNI_AXIS_NUM],
+                                         float wheel_speed_fit[OMNI_WHEEL_NUM])
+{
+    for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
+        float speed_fit = 0.0f;
+
+        for (uint8_t axis = 0; axis < OMNI_AXIS_NUM; ++axis) {
+            speed_fit += ctrl->h[wheel][axis] * ref[axis];
+        }
+        wheel_speed_fit[wheel] = speed_fit;
+    }
+}
+
+static float OmniSanitizeSearchScale(float scale, float fallback)
+{
+    if (isfinite(scale) == 0) {
+        scale = fallback;
+    }
+    if (scale < 0.0f) {
+        scale = 0.0f;
+    }
+    if (scale > OMNI_ROTATE_SEARCH_SCALE_MAX) {
+        scale = OMNI_ROTATE_SEARCH_SCALE_MAX;
+    }
+    return scale;
+}
+
+static void OmniBuildRefForScale(const float base_ref[OMNI_AXIS_NUM],
+                                 float sv,
+                                 float sw,
+                                 float ref[OMNI_AXIS_NUM])
+{
+    sv = OmniSanitizeSearchScale(sv, 0.0f);
+    sw = OmniClamp(OmniSanitizeSearchScale(sw, 0.0f), 0.0f, 1.0f);
+
+    ref[OMNI_AXIS_VX] = base_ref[OMNI_AXIS_VX] * sv;
+    ref[OMNI_AXIS_VY] = base_ref[OMNI_AXIS_VY] * sv;
+    ref[OMNI_AXIS_WZ] = base_ref[OMNI_AXIS_WZ] * sw;
+}
+
+static float OmniRotateWzSearchSign(const OmniVelocityCtrlInput_s *input,
+                                    float ramped_wz_ref)
+{
+    if (input != 0 &&
+        isfinite(input->wz_ref) != 0 &&
+        OmniAbs(input->wz_ref) > OMNI_ROTATE_VXY_ACTIVE_EPS) {
+        return (input->wz_ref < 0.0f) ? -1.0f : 1.0f;
+    }
+    if (isfinite(ramped_wz_ref) != 0 &&
+        OmniAbs(ramped_wz_ref) > OMNI_ROTATE_VXY_ACTIVE_EPS) {
+        return (ramped_wz_ref < 0.0f) ? -1.0f : 1.0f;
+    }
+    return 1.0f;
+}
+
+static float OmniRotateWzSearchAbsLimit(const OmniVelocityCtrlInput_s *input,
+                                        float ramped_wz_ref)
+{
+    float limit = 0.0f;
+
+    if (input != 0 && isfinite(input->rotate_wz_search_limit) != 0) {
+        limit = OmniAbs(input->rotate_wz_search_limit);
+    }
+    if (limit <= OMNI_ROTATE_VXY_ACTIVE_EPS &&
+        input != 0 &&
+        isfinite(input->wz_ref) != 0) {
+        limit = OmniAbs(input->wz_ref);
+    }
+    if (limit <= OMNI_ROTATE_VXY_ACTIVE_EPS &&
+        isfinite(ramped_wz_ref) != 0) {
+        limit = OmniAbs(ramped_wz_ref);
+    }
+    return limit;
+}
+
+static void OmniApplyRotateWzSearchLimit(const OmniVelocityCtrlInput_s *input,
+                                         float base_ref[OMNI_AXIS_NUM])
+{
+    const float wz_limit =
+        OmniRotateWzSearchAbsLimit(input, base_ref[OMNI_AXIS_WZ]);
+
+    if (wz_limit <= OMNI_ROTATE_VXY_ACTIVE_EPS) {
+        return;
+    }
+
+    base_ref[OMNI_AXIS_WZ] =
+        OmniRotateWzSearchSign(input, base_ref[OMNI_AXIS_WZ]) * wz_limit;
+}
+
+static float OmniMaxAbsWheelSpeedForRef(const OmniVelocityCtrl_s *ctrl,
+                                        const float ref[OMNI_AXIS_NUM])
+{
+    float wheel_speed_fit[OMNI_WHEEL_NUM];
+    float max_abs_speed = 0.0f;
+
+    OmniBuildWheelSpeedFitForRef(ctrl, ref, wheel_speed_fit);
+    for (uint8_t wheel = 0U; wheel < OMNI_WHEEL_NUM; ++wheel) {
+        const float abs_speed = OmniAbs(wheel_speed_fit[wheel]);
+
+        if (abs_speed > max_abs_speed) {
+            max_abs_speed = abs_speed;
+        }
+    }
+    return max_abs_speed;
+}
+
+static float OmniPowerWheelSpeedLimit(const OmniVelocityCtrl_s *ctrl)
+{
+    const float limit = ctrl->config.power_wheel_speed_limit;
+
+    return (limit > 0.0f && isfinite(limit) != 0) ?
+        limit : OMNI_POWER_WHEEL_SPEED_LIMIT_DEFAULT;
+}
+
+static float OmniVxyMagnitude(const float ref[OMNI_AXIS_NUM])
+{
+    return sqrtf(ref[OMNI_AXIS_VX] * ref[OMNI_AXIS_VX] +
+                 ref[OMNI_AXIS_VY] * ref[OMNI_AXIS_VY]);
+}
+
+static uint8_t OmniBuildVxyDir(const float ref[OMNI_AXIS_NUM],
+                               float *mag,
+                               float *dir_x,
+                               float *dir_y)
+{
+    const float vxy = OmniVxyMagnitude(ref);
+
+    if (mag != 0) {
+        *mag = vxy;
+    }
+    if (vxy <= OMNI_ROTATE_VXY_ACTIVE_EPS || isfinite(vxy) == 0) {
+        if (dir_x != 0) {
+            *dir_x = 0.0f;
+        }
+        if (dir_y != 0) {
+            *dir_y = 0.0f;
+        }
+        return 0U;
+    }
+
+    if (dir_x != 0) {
+        *dir_x = ref[OMNI_AXIS_VX] / vxy;
+    }
+    if (dir_y != 0) {
+        *dir_y = ref[OMNI_AXIS_VY] / vxy;
+    }
+    return 1U;
+}
+
+static uint8_t OmniScalarMatches(float cached, float current, float abs_tol, float rel_tol)
+{
+    float tol;
+
+    if (isfinite(cached) == 0 || isfinite(current) == 0 || cached <= 0.0f || current <= 0.0f) {
+        return 0U;
+    }
+
+    tol = abs_tol + rel_tol * OmniAbs(current);
+    return (OmniAbs(cached - current) <= tol) ? 1U : 0U;
+}
+
+static void OmniClearReachableCacheState(OmniVelocityCtrl_s *ctrl)
+{
+    ctrl->reachable_vxy_valid = 0U;
+    ctrl->reachable_wz_valid = 0U;
+    ctrl->rotate_strategy_active = 0U;
+    ctrl->reachable_vxy_search_success = 0U;
+    ctrl->reachable_wz_search_success = 0U;
+    ctrl->reachable_vxy_max = 0.0f;
+    ctrl->reachable_wz_max = 0.0f;
+    ctrl->reachable_vxy_dir_x = 0.0f;
+    ctrl->reachable_vxy_dir_y = 0.0f;
+    ctrl->reachable_vxy_budget_w = 0.0f;
+    ctrl->reachable_wz_budget_w = 0.0f;
+    ctrl->reachable_vxy_wheel_speed_limit = 0.0f;
+    ctrl->reachable_wz_wheel_speed_limit = 0.0f;
+}
+
+static void OmniStoreReachableVxy(OmniVelocityCtrl_s *ctrl,
+                                  float vxy_max,
+                                  float dir_x,
+                                  float dir_y,
+                                  float budget_w,
+                                  float wheel_speed_limit)
+{
+    ctrl->reachable_vxy_valid =
+        (isfinite(vxy_max) != 0 &&
+         isfinite(dir_x) != 0 &&
+         isfinite(dir_y) != 0 &&
+         isfinite(budget_w) != 0 &&
+         isfinite(wheel_speed_limit) != 0 &&
+         vxy_max > OMNI_ROTATE_VXY_ACTIVE_EPS &&
+         budget_w > 0.0f &&
+         wheel_speed_limit > 0.0f) ? 1U : 0U;
+    ctrl->reachable_vxy_max = (ctrl->reachable_vxy_valid != 0U) ? vxy_max : 0.0f;
+    ctrl->reachable_vxy_dir_x = (ctrl->reachable_vxy_valid != 0U) ? dir_x : 0.0f;
+    ctrl->reachable_vxy_dir_y = (ctrl->reachable_vxy_valid != 0U) ? dir_y : 0.0f;
+    ctrl->reachable_vxy_budget_w = (ctrl->reachable_vxy_valid != 0U) ? budget_w : 0.0f;
+    ctrl->reachable_vxy_wheel_speed_limit =
+        (ctrl->reachable_vxy_valid != 0U) ? wheel_speed_limit : 0.0f;
+}
+
+static void OmniStoreReachableWz(OmniVelocityCtrl_s *ctrl,
+                                 float wz_max,
+                                 float budget_w,
+                                 float wheel_speed_limit)
+{
+    ctrl->reachable_wz_valid =
+        (isfinite(wz_max) != 0 &&
+         isfinite(budget_w) != 0 &&
+         isfinite(wheel_speed_limit) != 0 &&
+         wz_max > OMNI_ROTATE_VXY_ACTIVE_EPS &&
+         budget_w > 0.0f &&
+         wheel_speed_limit > 0.0f) ? 1U : 0U;
+    ctrl->reachable_wz_max = (ctrl->reachable_wz_valid != 0U) ? wz_max : 0.0f;
+    ctrl->reachable_wz_budget_w = (ctrl->reachable_wz_valid != 0U) ? budget_w : 0.0f;
+    ctrl->reachable_wz_wheel_speed_limit =
+        (ctrl->reachable_wz_valid != 0U) ? wheel_speed_limit : 0.0f;
+}
+
+static void OmniApplyReferenceScale(OmniVelocityCtrl_s *ctrl,
+                                    const float base_ref[OMNI_AXIS_NUM],
+                                    float sv,
+                                    float sw,
+                                    float dt)
+{
+    ctrl->power_vxy_scale = OmniClamp(sv, 0.0f, 1.0f);
+    ctrl->power_wz_scale = OmniClamp(sw, 0.0f, 1.0f);
+
+    ctrl->nu_ref[OMNI_AXIS_VX] = base_ref[OMNI_AXIS_VX] * ctrl->power_vxy_scale;
+    ctrl->nu_ref[OMNI_AXIS_VY] = base_ref[OMNI_AXIS_VY] * ctrl->power_vxy_scale;
+    ctrl->nu_ref[OMNI_AXIS_WZ] = base_ref[OMNI_AXIS_WZ] * ctrl->power_wz_scale;
+
+    for (uint8_t axis = 0; axis < OMNI_AXIS_NUM; ++axis) {
+        ctrl->nu_ref_dot[axis] = (ctrl->nu_ref[axis] - ctrl->nu_ref_last[axis]) / dt;
+    }
+}
+
+static uint8_t OmniReachableVxyMatches(const OmniVelocityCtrl_s *ctrl,
+                                       float dir_x,
+                                       float dir_y,
+                                       float budget_w,
+                                       float wheel_speed_limit)
+{
+    const float dot = ctrl->reachable_vxy_dir_x * dir_x +
+                      ctrl->reachable_vxy_dir_y * dir_y;
+
+    if (ctrl->reachable_vxy_valid == 0U ||
+        dot < OMNI_REACHABLE_DIR_DOT_MIN ||
+        OmniScalarMatches(ctrl->reachable_vxy_budget_w,
+                          budget_w,
+                          OMNI_REACHABLE_BUDGET_ABS_TOL_W,
+                          OMNI_REACHABLE_BUDGET_REL_TOL) == 0U ||
+        OmniScalarMatches(ctrl->reachable_vxy_wheel_speed_limit,
+                          wheel_speed_limit,
+                          OMNI_POWER_SCALE_EPS,
+                          OMNI_REACHABLE_BUDGET_REL_TOL) == 0U) {
+        return 0U;
+    }
+    return 1U;
+}
+
+static uint8_t OmniReachableWzMatches(const OmniVelocityCtrl_s *ctrl,
+                                      float budget_w,
+                                      float wheel_speed_limit)
+{
+    if (ctrl->reachable_wz_valid == 0U ||
+        OmniScalarMatches(ctrl->reachable_wz_budget_w,
+                          budget_w,
+                          OMNI_REACHABLE_BUDGET_ABS_TOL_W,
+                          OMNI_REACHABLE_BUDGET_REL_TOL) == 0U ||
+        OmniScalarMatches(ctrl->reachable_wz_wheel_speed_limit,
+                          wheel_speed_limit,
+                          OMNI_POWER_SCALE_EPS,
+                          OMNI_REACHABLE_BUDGET_REL_TOL) == 0U) {
+        return 0U;
+    }
+    return 1U;
+}
+
+static float OmniEstimateSpeedLoopCurrentFit(const OmniVelocityCtrl_s *ctrl,
+                                             const OmniVelocityCtrlInput_s *input,
+                                             uint8_t wheel,
+                                             float wheel_speed_ref_fit,
+                                             float force_cmd)
+{
+    const float ratio = (input->wheel_to_motor_speed_ratio > 1.0e-6f &&
+                         isfinite(input->wheel_to_motor_speed_ratio) != 0) ?
+        input->wheel_to_motor_speed_ratio : 1.0f;
+    const float motor_ref =
+        ctrl->config.wheel_dir[wheel] * wheel_speed_ref_fit * ratio;
+    const float motor_feedback = input->wheel_speed[wheel] * ratio;
+    const float err = motor_ref - motor_feedback;
+    const float kp = (isfinite(input->speed_power_kp[wheel]) != 0) ?
+        input->speed_power_kp[wheel] : 0.0f;
+    const float iout = (isfinite(input->speed_power_iout[wheel]) != 0) ?
+        input->speed_power_iout[wheel] : 0.0f;
+    const float deadband = (input->speed_power_deadband[wheel] > 0.0f &&
+                            isfinite(input->speed_power_deadband[wheel]) != 0) ?
+        input->speed_power_deadband[wheel] : 0.0f;
+    const float output_limit = (input->speed_power_output_limit[wheel] > 0.0f &&
+                                isfinite(input->speed_power_output_limit[wheel]) != 0) ?
+        input->speed_power_output_limit[wheel] : 16384.0f;
+    float speed_pid_current_motor = 0.0f;
+    const float ff_current_fit = OmniForceToCurrentFit(ctrl,
+                                                       wheel,
+                                                       force_cmd,
+                                                       input->current_offset_enable);
+    const float ff_current_motor = ctrl->config.wheel_dir[wheel] * ff_current_fit;
+
+    if (OmniAbs(err) > deadband) {
+        speed_pid_current_motor = kp * err + iout;
+        speed_pid_current_motor = OmniClampAbs(speed_pid_current_motor, output_limit);
+    }
+
+    return ctrl->config.wheel_dir[wheel] *
+        (speed_pid_current_motor + ff_current_motor);
+}
+
+static float OmniEstimatePositiveWheelPower(const OmniVelocityCtrl_s *ctrl,
+                                            const OmniVelocityCtrlInput_s *input,
+                                            const float force_cmd[OMNI_WHEEL_NUM],
+                                            const float ref[OMNI_AXIS_NUM])
+{
+    const float wheel_radius_m = OmniWheelRadiusM();
+    float wheel_speed_ref_fit[OMNI_WHEEL_NUM] = {0.0f};
+    float power_w = 0.0f;
+
+    if (input->speed_power_model_enable != 0U) {
+        OmniBuildWheelSpeedFitForRef(ctrl, ref, wheel_speed_ref_fit);
+    }
+
+    for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
+        float force_for_power = force_cmd[wheel];
+        float wheel_speed_fit;
+
+        if (input->speed_power_model_enable != 0U) {
+            const float current_fit =
+                OmniEstimateSpeedLoopCurrentFit(ctrl,
+                                                input,
+                                                wheel,
+                                                wheel_speed_ref_fit[wheel],
+                                                force_cmd[wheel]);
+            force_for_power = OmniCurrentFitToForce(ctrl,
+                                                    wheel,
+                                                    current_fit,
+                                                    input->current_offset_enable);
+            wheel_speed_fit = wheel_speed_ref_fit[wheel];
+        } else {
+            wheel_speed_fit = ctrl->config.wheel_dir[wheel] * input->wheel_speed[wheel];
+        }
+
+        const float wheel_speed_mps = wheel_speed_fit * DEGREE_2_RAD * wheel_radius_m;
+        const float wheel_power_w = force_for_power * wheel_speed_mps;
+
+        if (isfinite(wheel_power_w) != 0 && wheel_power_w > 0.0f) {
+            power_w += wheel_power_w;
+        }
+    }
+    return power_w;
+}
+
+static float OmniEstimatePowerForScale(const OmniVelocityCtrl_s *ctrl,
+                                       const OmniVelocityCtrlInput_s *input,
+                                       const float base_ref[OMNI_AXIS_NUM],
+                                       float sv,
+                                       float sw,
+                                       float dt)
+{
+    float ref[OMNI_AXIS_NUM];
+    float ref_dot[OMNI_AXIS_NUM];
+    float wrench[OMNI_AXIS_NUM];
+    float force_cmd[OMNI_WHEEL_NUM];
+    uint8_t limit_active = 0U;
+
+    OmniBuildRefForScale(base_ref, sv, sw, ref);
+
+    for (uint8_t axis = 0; axis < OMNI_AXIS_NUM; ++axis) {
+        ref_dot[axis] = (ref[axis] - ctrl->nu_ref_last[axis]) / dt;
+    }
+
+    OmniPredictWrenchForRef(ctrl, input, ref, ref_dot, wrench);
+    OmniAllocateForceForWrench(ctrl, input, wrench, force_cmd, &limit_active);
+    return OmniEstimatePositiveWheelPower(ctrl, input, force_cmd, ref);
+}
+
+static uint8_t OmniScaleFitsSearchBudget(const OmniVelocityCtrl_s *ctrl,
+                                         const OmniVelocityCtrlInput_s *input,
+                                         const float base_ref[OMNI_AXIS_NUM],
+                                         float sv,
+                                         float sw,
+                                         float budget_w,
+                                         float wheel_speed_limit,
+                                         float dt,
+                                         float *power_w)
+{
+    float ref[OMNI_AXIS_NUM];
+    const float power =
+        OmniEstimatePowerForScale(ctrl, input, base_ref, sv, sw, dt);
+
+    if (power_w != 0) {
+        *power_w = power;
+    }
+    if (isfinite(budget_w) == 0 ||
+        budget_w <= 0.0f ||
+        isfinite(power) == 0 ||
+        power > budget_w + OMNI_POWER_SCALE_EPS) {
+        return 0U;
+    }
+
+    if (wheel_speed_limit > 0.0f && isfinite(wheel_speed_limit) != 0) {
+        OmniBuildRefForScale(base_ref, sv, sw, ref);
+        if (OmniMaxAbsWheelSpeedForRef(ctrl, ref) >
+            wheel_speed_limit + OMNI_POWER_SCALE_EPS) {
+            return 0U;
+        }
+    }
+
+    return 1U;
+}
+
+static float OmniFindPureVxyScaleHigh(const OmniVelocityCtrl_s *ctrl,
+                                      const float base_ref[OMNI_AXIS_NUM],
+                                      float wheel_speed_limit)
+{
+    float max_abs_speed_per_scale = 0.0f;
+
+    if (wheel_speed_limit <= 0.0f || isfinite(wheel_speed_limit) == 0) {
+        return 1.0f;
+    }
+
+    for (uint8_t wheel = 0U; wheel < OMNI_WHEEL_NUM; ++wheel) {
+        const float speed_per_scale =
+            ctrl->h[wheel][OMNI_AXIS_VX] * base_ref[OMNI_AXIS_VX] +
+            ctrl->h[wheel][OMNI_AXIS_VY] * base_ref[OMNI_AXIS_VY];
+        const float abs_speed = OmniAbs(speed_per_scale);
+
+        if (abs_speed > max_abs_speed_per_scale) {
+            max_abs_speed_per_scale = abs_speed;
+        }
+    }
+
+    if (max_abs_speed_per_scale <= OMNI_POWER_SCALE_EPS) {
+        return 1.0f;
+    }
+
+    return OmniSanitizeSearchScale(wheel_speed_limit / max_abs_speed_per_scale,
+                                   1.0f);
+}
+
+static float OmniFindMaxSvForPower(const OmniVelocityCtrl_s *ctrl,
+                                   const OmniVelocityCtrlInput_s *input,
+                                   const float base_ref[OMNI_AXIS_NUM],
+                                   float sw,
+                                   float low,
+                                   float high,
+                                   float budget_w,
+                                   float wheel_speed_limit,
+                                   float dt)
+{
+    low = OmniSanitizeSearchScale(low, 0.0f);
+    high = OmniSanitizeSearchScale(high, low);
+    if (high < low) {
+        high = low;
+    }
+
+    if (OmniScaleFitsSearchBudget(ctrl,
+                                  input,
+                                  base_ref,
+                                  low,
+                                  sw,
+                                  budget_w,
+                                  wheel_speed_limit,
+                                  dt,
+                                  0) == 0U) {
+        return low;
+    }
+    if (OmniScaleFitsSearchBudget(ctrl,
+                                  input,
+                                  base_ref,
+                                  high,
+                                  sw,
+                                  budget_w,
+                                  wheel_speed_limit,
+                                  dt,
+                                  0) != 0U) {
+        return high;
+    }
+
+    for (uint8_t i = 0U; i < OMNI_POWER_SCALE_BISECT_STEPS; ++i) {
+        const float mid = 0.5f * (low + high);
+
+        if (OmniScaleFitsSearchBudget(ctrl,
+                                      input,
+                                      base_ref,
+                                      mid,
+                                      sw,
+                                      budget_w,
+                                      wheel_speed_limit,
+                                      dt,
+                                      0) != 0U) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+static float OmniFindMaxSwForPower(const OmniVelocityCtrl_s *ctrl,
+                                   const OmniVelocityCtrlInput_s *input,
+                                   const float base_ref[OMNI_AXIS_NUM],
+                                   float sv,
+                                   float high,
+                                   float budget_w,
+                                   float wheel_speed_limit,
+                                   float dt)
+{
+    float low = 0.0f;
+    high = OmniClamp(OmniSanitizeSearchScale(high, 1.0f), 0.0f, 1.0f);
+
+    if (OmniScaleFitsSearchBudget(ctrl,
+                                  input,
+                                  base_ref,
+                                  sv,
+                                  low,
+                                  budget_w,
+                                  wheel_speed_limit,
+                                  dt,
+                                  0) == 0U) {
+        return 0.0f;
+    }
+    if (OmniScaleFitsSearchBudget(ctrl,
+                                  input,
+                                  base_ref,
+                                  sv,
+                                  high,
+                                  budget_w,
+                                  wheel_speed_limit,
+                                  dt,
+                                  0) != 0U) {
+        return high;
+    }
+
+    for (uint8_t i = 0U; i < OMNI_POWER_SCALE_BISECT_STEPS; ++i) {
+        const float mid = 0.5f * (low + high);
+
+        if (OmniScaleFitsSearchBudget(ctrl,
+                                      input,
+                                      base_ref,
+                                      sv,
+                                      mid,
+                                      budget_w,
+                                      wheel_speed_limit,
+                                      dt,
+                                      0) != 0U) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+static uint8_t OmniMeasuredPowerValid(const OmniVelocityCtrlInput_s *input)
+{
+    if (input == 0 ||
+        input->measured_power_valid == 0U ||
+        isfinite(input->measured_power_w) == 0 ||
+        input->measured_power_w <= 0.0f) {
+        return 0U;
+    }
+    return 1U;
+}
+
+static void OmniUpdatePowerFeedback(OmniVelocityCtrl_s *ctrl,
+                                    const OmniVelocityCtrlInput_s *input,
+                                    float dt)
+{
+    ctrl->power_real_valid = OmniMeasuredPowerValid(input);
+    ctrl->power_real_w = (ctrl->power_real_valid != 0U) ? input->measured_power_w : 0.0f;
+
+    if (ctrl->power_real_valid != 0U) {
+        const float tau_s =
+            (ctrl->config.power_feedback_lpf_tau_s > 0.0f &&
+             isfinite(ctrl->config.power_feedback_lpf_tau_s) != 0) ?
+            ctrl->config.power_feedback_lpf_tau_s :
+            OMNI_POWER_FEEDBACK_DEFAULT_LPF_TAU_S;
+        const float alpha = OmniClamp(dt / (tau_s + dt), 0.0f, 1.0f);
+
+        if (ctrl->power_real_lpf_valid == 0U ||
+            isfinite(ctrl->power_real_lpf_w) == 0) {
+            ctrl->power_real_lpf_w = ctrl->power_real_w;
+            ctrl->power_real_lpf_valid = 1U;
+        } else {
+            ctrl->power_real_lpf_w += alpha * (ctrl->power_real_w - ctrl->power_real_lpf_w);
+        }
+    } else {
+        ctrl->power_real_lpf_w = 0.0f;
+        ctrl->power_real_lpf_valid = 0U;
+    }
+}
+
+static void OmniUpdatePowerFeedbackScale(OmniVelocityCtrl_s *ctrl,
+                                         const OmniVelocityCtrlInput_s *input,
+                                         float power_est_full_w)
+{
+    const float limit_w = input->temp_power_limit_w;
+    const float deadband_w =
+        (ctrl->config.power_feedback_deadband_w > 0.0f) ?
+        ctrl->config.power_feedback_deadband_w : 0.0f;
+    const float min_scale =
+        OmniClamp(ctrl->config.power_feedback_scale_min, 0.01f, 1.0f);
+    const float down_alpha =
+        OmniClamp(ctrl->config.power_feedback_down_alpha, 0.0f, 1.0f);
+    const float up_alpha =
+        OmniClamp(ctrl->config.power_feedback_up_alpha, 0.0f, 1.0f);
+    const float local_min_ratio =
+        OmniClamp(ctrl->config.power_feedback_local_min_ratio, 0.0f, 1.0f);
+    float scale = ctrl->power_feedback_scale;
+
+    if (isfinite(scale) == 0 || scale < min_scale || scale > 1.0f) {
+        scale = 1.0f;
+    }
+
+    if (isfinite(limit_w) == 0 || limit_w <= 0.0f) {
+        scale += up_alpha * (1.0f - scale);
+        ctrl->power_feedback_scale = OmniClamp(scale, min_scale, 1.0f);
+        ctrl->power_effective_limit_w = 0.0f;
+        return;
+    }
+
+    if (ctrl->power_real_lpf_valid != 0U &&
+        power_est_full_w > limit_w * local_min_ratio &&
+        ctrl->power_real_lpf_w > limit_w + deadband_w &&
+        ctrl->power_real_lpf_w > 1.0e-6f) {
+        const float target_scale =
+            OmniClamp(limit_w / ctrl->power_real_lpf_w, min_scale, 1.0f);
+        const float alpha = (target_scale < scale) ? down_alpha : up_alpha;
+
+        scale += alpha * (target_scale - scale);
+    } else {
+        scale += up_alpha * (1.0f - scale);
+    }
+
+    ctrl->power_feedback_scale = OmniClamp(scale, min_scale, 1.0f);
+    ctrl->power_effective_limit_w = limit_w * ctrl->power_feedback_scale;
+}
+
+static void OmniApplyPowerVelocityScale(OmniVelocityCtrl_s *ctrl,
+                                        const OmniVelocityCtrlInput_s *input,
+                                        float dt)
+{
+    float limit_w;
+    float budget_w;
+    float wheel_speed_limit;
+    float base_ref[OMNI_AXIS_NUM];
+    float power_full;
+    float sv = 1.0f;
+    float sw = 1.0f;
+    const uint8_t rotate_priority =
+        (input->rotate_power_priority_enable != 0U) ? 1U : 0U;
+    const uint8_t search_only =
+        (input->power_search_only_enable != 0U) ? 1U : 0U;
+
+    ctrl->power_vxy_scale = 1.0f;
+    ctrl->power_wz_scale = 1.0f;
+    ctrl->power_est_full_w = 0.0f;
+    ctrl->power_est_limited_w = 0.0f;
+    ctrl->power_limit_active = 0U;
+    ctrl->rotate_strategy_active = 0U;
+    ctrl->reachable_vxy_search_success = 0U;
+    ctrl->reachable_wz_search_success = 0U;
+
+    if (isfinite(input->temp_power_limit_w) == 0 || input->temp_power_limit_w <= 0.0f) {
+        OmniUpdatePowerFeedbackScale(ctrl, input, 0.0f);
+        return;
+    }
+
+    for (uint8_t axis = 0; axis < OMNI_AXIS_NUM; ++axis) {
+        base_ref[axis] = ctrl->nu_ref[axis];
+    }
+    if (rotate_priority != 0U) {
+        OmniApplyRotateWzSearchLimit(input, base_ref);
+    }
+
+    power_full = OmniEstimatePowerForScale(ctrl, input, base_ref, 1.0f, 1.0f, dt);
+    ctrl->power_est_full_w = power_full;
+    OmniUpdatePowerFeedbackScale(ctrl, input, power_full);
+
+    limit_w = ctrl->power_effective_limit_w;
+    budget_w = limit_w * OmniClamp(ctrl->config.power_budget_margin, 0.1f, 1.0f);
+    wheel_speed_limit = OmniPowerWheelSpeedLimit(ctrl);
+    ctrl->power_limit_active = 0U;
+
+    if (isfinite(limit_w) == 0 || limit_w <= 0.0f || budget_w <= 0.0f) {
+        return;
+    }
+
+    const float floor_ratio = OmniClamp(ctrl->config.power_vxy_floor_ratio, 0.0f, 1.0f);
+    float vxy_abs = 0.0f;
+    float dir_x = 0.0f;
+    float dir_y = 0.0f;
+    const uint8_t vxy_active = OmniBuildVxyDir(base_ref, &vxy_abs, &dir_x, &dir_y);
+
+    if (rotate_priority == 0U) {
+        if (search_only != 0U && vxy_active != 0U) {
+            const float sv_high =
+                OmniFindPureVxyScaleHigh(ctrl, base_ref, wheel_speed_limit);
+            const float sv_pure_max =
+                OmniFindMaxSvForPower(ctrl,
+                                      input,
+                                      base_ref,
+                                      0.0f,
+                                      0.0f,
+                                      sv_high,
+                                      budget_w,
+                                      wheel_speed_limit,
+                                      dt);
+
+            OmniStoreReachableVxy(ctrl,
+                                  vxy_abs * sv_pure_max,
+                                  dir_x,
+                                  dir_y,
+                                  budget_w,
+                                  wheel_speed_limit);
+            ctrl->reachable_vxy_search_success = ctrl->reachable_vxy_valid;
+        }
+        ctrl->power_est_limited_w = power_full;
+        ctrl->power_limit_active = 0U;
+        return;
+    }
+
+    if (rotate_priority != 0U) {
+        if (vxy_active == 0U) {
+            const float wz_abs = OmniAbs(base_ref[OMNI_AXIS_WZ]);
+
+            sv = 0.0f;
+            sw = OmniFindMaxSwForPower(ctrl,
+                                       input,
+                                       base_ref,
+                                       0.0f,
+                                       1.0f,
+                                       budget_w,
+                                       wheel_speed_limit,
+                                       dt);
+            OmniStoreReachableWz(ctrl,
+                                 wz_abs * sw,
+                                 budget_w,
+                                 wheel_speed_limit);
+            ctrl->reachable_wz_search_success = ctrl->reachable_wz_valid;
+            ctrl->power_limit_active = 1U;
+            OmniApplyReferenceScale(ctrl, base_ref, sv, sw, dt);
+        } else {
+            const uint8_t vxy_cache_ok =
+                OmniReachableVxyMatches(ctrl, dir_x, dir_y, budget_w, wheel_speed_limit);
+            const uint8_t wz_cache_ok =
+                OmniReachableWzMatches(ctrl, budget_w, wheel_speed_limit);
+
+            if (vxy_cache_ok == 0U || wz_cache_ok == 0U) {
+                ctrl->power_est_limited_w = power_full;
+                ctrl->power_limit_active = 0U;
+                return;
+            }
+
+            const float vxy_reserved =
+                OmniClamp(floor_ratio * ctrl->reachable_vxy_max, 0.0f, vxy_abs);
+            const float wz_abs = OmniAbs(base_ref[OMNI_AXIS_WZ]);
+            float sw_high = 1.0f;
+
+            sv = (vxy_abs > OMNI_ROTATE_VXY_ACTIVE_EPS) ?
+                OmniClamp(vxy_reserved / vxy_abs, 0.0f, 1.0f) : 0.0f;
+            if (wz_abs > OMNI_ROTATE_VXY_ACTIVE_EPS &&
+                ctrl->reachable_wz_max > 0.0f &&
+                isfinite(ctrl->reachable_wz_max) != 0) {
+                sw_high = OmniClamp(ctrl->reachable_wz_max / wz_abs, 0.0f, 1.0f);
+            }
+            sw = OmniFindMaxSwForPower(ctrl,
+                                       input,
+                                       base_ref,
+                                       sv,
+                                       sw_high,
+                                       budget_w,
+                                       wheel_speed_limit,
+                                       dt);
+            ctrl->rotate_strategy_active = 1U;
+            ctrl->power_limit_active = 1U;
+            OmniApplyReferenceScale(ctrl, base_ref, sv, sw, dt);
+        }
+
+        ctrl->power_est_limited_w =
+            OmniEstimatePowerForScale(ctrl,
+                                      input,
+                                      base_ref,
+                                      ctrl->power_vxy_scale,
+                                      ctrl->power_wz_scale,
+                                      dt);
+        return;
+    }
+}
+
 static void OmniUpdateSlipRecord(OmniVelocityCtrl_s *ctrl,
                                  const OmniVelocityCtrlInput_s *input)
 {
@@ -633,42 +1578,6 @@ static void OmniUpdateSlipRecord(OmniVelocityCtrl_s *ctrl,
             update_alpha = OMNI_SLIP_RECOVERY_ALPHA;
         }
         ctrl->slip_prob[wheel] += update_alpha * (score - ctrl->slip_prob[wheel]);
-    }
-}
-
-static void OmniApplyTemporaryPowerLimit(const OmniVelocityCtrl_s *ctrl,
-                                         const OmniVelocityCtrlInput_s *input,
-                                         float force_cmd[OMNI_WHEEL_NUM],
-                                         uint8_t *limit_active)
-{
-    const float limit_w = input->temp_power_limit_w;
-    const float wheel_radius_m = OmniWheelRadiusM();
-    float estimated_power_w = 0.0f;
-
-    if (limit_w <= 0.0f) {
-        return;
-    }
-
-    for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
-        const float wheel_speed_fit =
-            ctrl->config.wheel_dir[wheel] * input->wheel_speed[wheel];
-        const float wheel_speed_mps = wheel_speed_fit * DEGREE_2_RAD * wheel_radius_m;
-        const float wheel_power_w = force_cmd[wheel] * wheel_speed_mps;
-
-        if (wheel_power_w > 0.0f) {
-            estimated_power_w += wheel_power_w;
-        }
-    }
-
-    if (estimated_power_w > limit_w && estimated_power_w > 1.0e-6f) {
-        const float scale = limit_w / estimated_power_w;
-
-        for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
-            force_cmd[wheel] *= scale;
-        }
-        if (limit_active != 0) {
-            *limit_active = 1U;
-        }
     }
 }
 
@@ -765,10 +1674,29 @@ static void OmniFillOutput(OmniVelocityCtrl_s *ctrl,
     }
     output->limit_active = (uint8_t)(limit_active |
                                      current_limit_active |
-                                     current_rate_limit_active);
+                                     current_rate_limit_active |
+                                     ctrl->power_limit_active);
     output->current_limit_active = current_limit_active;
     output->current_rate_limit_active = current_rate_limit_active;
     output->lqi_wz_feedback_source = ctrl->lqi_wz_feedback_source;
+    output->power_limit_active = ctrl->power_limit_active;
+    output->power_real_valid = ctrl->power_real_valid;
+    output->power_vxy_scale = ctrl->power_vxy_scale;
+    output->power_wz_scale = ctrl->power_wz_scale;
+    output->power_est_full_w = ctrl->power_est_full_w;
+    output->power_est_limited_w = ctrl->power_est_limited_w;
+    output->power_real_w = ctrl->power_real_w;
+    output->power_feedback_scale = ctrl->power_feedback_scale;
+    output->power_effective_limit_w = ctrl->power_effective_limit_w;
+    output->reachable_vxy_valid = ctrl->reachable_vxy_valid;
+    output->reachable_wz_valid = ctrl->reachable_wz_valid;
+    output->rotate_strategy_active = ctrl->rotate_strategy_active;
+    output->reachable_vxy_search_success = ctrl->reachable_vxy_search_success;
+    output->reachable_wz_search_success = ctrl->reachable_wz_search_success;
+    output->reachable_vxy_max = ctrl->reachable_vxy_max;
+    output->reachable_wz_max = ctrl->reachable_wz_max;
+    output->reachable_vxy_dir_x = ctrl->reachable_vxy_dir_x;
+    output->reachable_vxy_dir_y = ctrl->reachable_vxy_dir_y;
 }
 
 void OmniVelocityCtrl_GetDefaultConfig(OmniVelocityCtrlConfig_s *config)
@@ -806,9 +1734,17 @@ void OmniVelocityCtrl_GetDefaultConfig(OmniVelocityCtrlConfig_s *config)
     for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
         config->force_to_cmd_pos[wheel] = 288.0f;
         config->force_to_cmd_neg[wheel] = 288.0f;
-        config->current_offset[wheel] = 0;//1300.0f;
+        config->current_offset[wheel] = 0.0f;
         config->wheel_current_limit[wheel] = 3000.0f;
     }
+    config->force_to_cmd_pos[OMNI_WHEEL_LF] = 192.7f;
+    config->force_to_cmd_neg[OMNI_WHEEL_LF] = 150.7f;
+    config->force_to_cmd_pos[OMNI_WHEEL_RF] = 263.8f;
+    config->force_to_cmd_neg[OMNI_WHEEL_RF] = 143.9f;
+    config->force_to_cmd_pos[OMNI_WHEEL_RB] = 801.5f;
+    config->force_to_cmd_neg[OMNI_WHEEL_RB] = 486.2f;
+    config->force_to_cmd_pos[OMNI_WHEEL_LB] = 848.1f;
+    config->force_to_cmd_neg[OMNI_WHEEL_LB] = 285.9f;
     config->eso_enable = 1U;
     config->eso_compensate_enable = 1U;
     config->eso_compensate_gain[OMNI_AXIS_VX] = 1.0f;
@@ -824,7 +1760,16 @@ void OmniVelocityCtrl_GetDefaultConfig(OmniVelocityCtrlConfig_s *config)
     config->slip_lpf_alpha = 0.05f;
     config->slip_force_enable = 1U;
     config->slip_force_gain = 10.0f;
-    config->slip_force_min_weight = 0.0f;
+    config->slip_force_min_weight = 1.0f;//0.7f;
+    config->power_vxy_floor_ratio = 0.6f;
+    config->power_budget_margin = OMNI_POWER_BUDGET_MARGIN_DEFAULT;
+    config->power_wheel_speed_limit = OMNI_POWER_WHEEL_SPEED_LIMIT_DEFAULT;
+    config->power_feedback_deadband_w = OMNI_POWER_FEEDBACK_DEFAULT_DEADBAND_W;
+    config->power_feedback_scale_min = OMNI_POWER_FEEDBACK_DEFAULT_SCALE_MIN;
+    config->power_feedback_down_alpha = OMNI_POWER_FEEDBACK_DEFAULT_DOWN_ALPHA;
+    config->power_feedback_up_alpha = OMNI_POWER_FEEDBACK_DEFAULT_UP_ALPHA;
+    config->power_feedback_lpf_tau_s = OMNI_POWER_FEEDBACK_DEFAULT_LPF_TAU_S;
+    config->power_feedback_local_min_ratio = OMNI_POWER_FEEDBACK_DEFAULT_LOCAL_MIN_RATIO;
 }
 
 void OmniVelocityCtrl_Init(OmniVelocityCtrl_s *ctrl, const OmniVelocityCtrlConfig_s *config)
@@ -863,6 +1808,44 @@ void OmniVelocityCtrl_Init(OmniVelocityCtrl_s *ctrl, const OmniVelocityCtrlConfi
     } else if (ctrl->config.slip_force_min_weight > 1.0f) {
         ctrl->config.slip_force_min_weight = 1.0f;
     }
+    if (ctrl->config.power_vxy_floor_ratio < 0.0f) {
+        ctrl->config.power_vxy_floor_ratio = 0.0f;
+    } else if (ctrl->config.power_vxy_floor_ratio > 1.0f) {
+        ctrl->config.power_vxy_floor_ratio = 1.0f;
+    }
+    if (ctrl->config.power_budget_margin <= 0.0f ||
+        ctrl->config.power_budget_margin > 1.0f) {
+        ctrl->config.power_budget_margin = OMNI_POWER_BUDGET_MARGIN_DEFAULT;
+    }
+    if (ctrl->config.power_wheel_speed_limit <= 0.0f ||
+        isfinite(ctrl->config.power_wheel_speed_limit) == 0) {
+        ctrl->config.power_wheel_speed_limit = OMNI_POWER_WHEEL_SPEED_LIMIT_DEFAULT;
+    }
+    if (ctrl->config.power_feedback_deadband_w < 0.0f) {
+        ctrl->config.power_feedback_deadband_w = 0.0f;
+    }
+    if (ctrl->config.power_feedback_scale_min <= 0.0f ||
+        ctrl->config.power_feedback_scale_min > 1.0f) {
+        ctrl->config.power_feedback_scale_min = OMNI_POWER_FEEDBACK_DEFAULT_SCALE_MIN;
+    }
+    if (ctrl->config.power_feedback_down_alpha < 0.0f ||
+        ctrl->config.power_feedback_down_alpha > 1.0f) {
+        ctrl->config.power_feedback_down_alpha = OMNI_POWER_FEEDBACK_DEFAULT_DOWN_ALPHA;
+    }
+    if (ctrl->config.power_feedback_up_alpha < 0.0f ||
+        ctrl->config.power_feedback_up_alpha > 1.0f) {
+        ctrl->config.power_feedback_up_alpha = OMNI_POWER_FEEDBACK_DEFAULT_UP_ALPHA;
+    }
+    if (ctrl->config.power_feedback_lpf_tau_s <= 0.0f ||
+        isfinite(ctrl->config.power_feedback_lpf_tau_s) == 0) {
+        ctrl->config.power_feedback_lpf_tau_s = OMNI_POWER_FEEDBACK_DEFAULT_LPF_TAU_S;
+    }
+    if (ctrl->config.power_feedback_local_min_ratio <= 0.0f ||
+        ctrl->config.power_feedback_local_min_ratio > 1.0f ||
+        isfinite(ctrl->config.power_feedback_local_min_ratio) == 0) {
+        ctrl->config.power_feedback_local_min_ratio =
+            OMNI_POWER_FEEDBACK_DEFAULT_LOCAL_MIN_RATIO;
+    }
     for (uint8_t wheel = 0; wheel < OMNI_WHEEL_NUM; ++wheel) {
         if (ctrl->config.wheel_dir[wheel] == 0.0f) {
             ctrl->config.wheel_dir[wheel] = 1.0f;
@@ -879,6 +1862,7 @@ void OmniVelocityCtrl_Init(OmniVelocityCtrl_s *ctrl, const OmniVelocityCtrlConfi
     }
 
     OmniBuildMatrix(ctrl);
+    ctrl->power_feedback_scale = 1.0f;
     ctrl->inited = 1U;
 }
 
@@ -894,16 +1878,74 @@ void OmniVelocityCtrl_Reset(OmniVelocityCtrl_s *ctrl)
     memset(ctrl, 0, sizeof(*ctrl));
     ctrl->config = saved_config;
     OmniBuildMatrix(ctrl);
+    ctrl->power_feedback_scale = 1.0f;
     ctrl->inited = 1U;
+}
+
+void OmniVelocityCtrl_ClearReachableCache(OmniVelocityCtrl_s *ctrl)
+{
+    if (ctrl == 0) {
+        return;
+    }
+
+    OmniClearReachableCacheState(ctrl);
+}
+
+void OmniVelocityCtrl_ExportReachableCache(const OmniVelocityCtrl_s *ctrl,
+                                           OmniReachableCache_s *cache)
+{
+    if (ctrl == 0 || cache == 0) {
+        return;
+    }
+
+    memset(cache, 0, sizeof(*cache));
+    cache->reachable_vxy_valid = ctrl->reachable_vxy_valid;
+    cache->reachable_wz_valid = ctrl->reachable_wz_valid;
+    cache->reachable_vxy_max = ctrl->reachable_vxy_max;
+    cache->reachable_wz_max = ctrl->reachable_wz_max;
+    cache->reachable_vxy_dir_x = ctrl->reachable_vxy_dir_x;
+    cache->reachable_vxy_dir_y = ctrl->reachable_vxy_dir_y;
+    cache->reachable_vxy_budget_w = ctrl->reachable_vxy_budget_w;
+    cache->reachable_wz_budget_w = ctrl->reachable_wz_budget_w;
+    cache->reachable_vxy_wheel_speed_limit = ctrl->reachable_vxy_wheel_speed_limit;
+    cache->reachable_wz_wheel_speed_limit = ctrl->reachable_wz_wheel_speed_limit;
+}
+
+void OmniVelocityCtrl_ImportReachableCache(OmniVelocityCtrl_s *ctrl,
+                                           const OmniReachableCache_s *cache)
+{
+    if (ctrl == 0 || cache == 0) {
+        return;
+    }
+
+    OmniClearReachableCacheState(ctrl);
+    if (cache->reachable_vxy_valid != 0U) {
+        OmniStoreReachableVxy(ctrl,
+                              cache->reachable_vxy_max,
+                              cache->reachable_vxy_dir_x,
+                              cache->reachable_vxy_dir_y,
+                              cache->reachable_vxy_budget_w,
+                              cache->reachable_vxy_wheel_speed_limit);
+    }
+    if (cache->reachable_wz_valid != 0U) {
+        OmniStoreReachableWz(ctrl,
+                             cache->reachable_wz_max,
+                             cache->reachable_wz_budget_w,
+                             cache->reachable_wz_wheel_speed_limit);
+    }
+    ctrl->reachable_vxy_search_success = 0U;
+    ctrl->reachable_wz_search_success = 0U;
+    ctrl->rotate_strategy_active = 0U;
 }
 
 /*
  * omni 速度控制主链路：
- * 1. 对 vx/vy/wz 参考做加速度限幅，并换算成 LQI 使用的 SI 单位参考。
+ * 1. 对 vx/vy/wz 原始参考做加速度限幅。
  * 2. 用四轮编码器速度反解车体速度；wz 闭环优先使用输入的 IMU yaw gyro。
- * 3. ESO 更新速度/扰动估计，LQI 根据参考、反馈和扰动补偿生成期望合力/力矩。
- * 4. 更新滑移概率并在多轮滑移时降额，再把期望合力/力矩分配成四轮轮力。
- * 5. 应用临时功率限制、电流幅值限制和电流变化率限制，最终转成 DJI raw current cmd。
+ * 3. ESO 更新速度/扰动估计，并在功率预算下分配可达 vxy/wz 参考。
+ * 4. LQI 根据降额后的参考、反馈和扰动补偿生成期望合力/力矩。
+ * 5. 更新滑移概率并在多轮滑移时降额，再把期望合力/力矩分配成四轮轮力。
+ * 6. 应用后置功率硬限幅、电流幅值限制和电流变化率限制，最终转成 DJI raw current cmd。
  */
 void OmniVelocityCtrl_Step(OmniVelocityCtrl_s *ctrl,
                            const OmniVelocityCtrlInput_s *input,
@@ -927,21 +1969,25 @@ void OmniVelocityCtrl_Step(OmniVelocityCtrl_s *ctrl,
     dt = OmniSanitizeDt(ctrl, input->dt);
 
     OmniLimitReference(ctrl, input, dt);
-    OmniUpdateLqiReference(ctrl);
     OmniEstimateVelocity(ctrl, input);
     OmniUpdateLqiFeedback(ctrl, input);
     OmniUpdateEso(ctrl, dt);
+    OmniUpdatePowerFeedback(ctrl, input, dt);
+    OmniApplyPowerVelocityScale(ctrl, input, dt);
+    OmniUpdateLqiReference(ctrl);
     OmniCalcDesiredWrench(ctrl, dt);
+    OmniApplyExternalWrenchFeedforward(ctrl, input);
     OmniUpdateSlipRecord(ctrl, input);
     OmniApplyMultiSlipWrenchDerate(ctrl);
     OmniAllocateForce(ctrl, input, force_cmd, &limit_active);
-    OmniApplyTemporaryPowerLimit(ctrl, input, force_cmd, &limit_active);
     OmniBuildCurrentRefs(ctrl,
                          input,
                          force_cmd,
                          &current_limit_active,
                          &current_rate_limit_active,
                          output);
+    ctrl->power_est_limited_w =
+        OmniEstimatePositiveWheelPower(ctrl, input, force_cmd, ctrl->nu_ref);
     OmniFillOutput(ctrl,
                    force_cmd,
                    limit_active,

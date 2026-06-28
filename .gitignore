@@ -5,14 +5,32 @@
 /build/
 /cmake-build-*/
 /CMakeFiles/
+/cmake/**/CMakeFiles/
 /CMakeCache.txt
+/cmake/**/CMakeCache.txt
 /cmake_install.cmake
+/cmake/**/cmake_install.cmake
 /compile_commands.json
+/cmake/**/compile_commands.json
 /Makefile
+/cmake/**/Makefile
 /*.elf
 /*.map
 /*.hex
 /*.bin
+**/*.elf
+**/*.map
+**/*.hex
+**/*.bin
+**/*.o
+**/*.obj
+**/*.obj.d
+**/*.su
+
+# Python / MATLAB local artifacts
+__pycache__/
+*.py[cod]
+*.asv
 
 # macOS
 .DS_Store

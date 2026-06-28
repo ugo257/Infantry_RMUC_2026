@@ -19,6 +19,7 @@
 #include "gimbal.h"
 #include "shoot.h"
 #include "robot_cmd.h"
+#include "yaw_jbc.h"
 
 void RobotInit()
 {
@@ -29,6 +30,7 @@ void RobotInit()
     buzzer_init();//蜂鸣器初始化
     BSPInit();
     RobotCMDInit();
+    YawJbc_LoadFromFlash();
     GimbalInit();
     ShootInit();
 #ifdef GIMBAL_BOARD

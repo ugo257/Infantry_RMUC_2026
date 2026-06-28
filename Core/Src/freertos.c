@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "bsp_usb.h"
 
 /* USER CODE END Includes */
 
@@ -79,7 +80,7 @@ const osThreadAttr_t Gimbal_attributes = {
 osThreadId_t ChassisHandle;
 const osThreadAttr_t Chassis_attributes = {
   .name = "Chassis",
-  .stack_size = 1024 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
 /* Definitions for Shoot */
@@ -110,6 +111,13 @@ const osThreadAttr_t Daemon_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityRealtime,
 };
+/* Definitions for Cal_JBC */
+osThreadId_t Cal_JBCHandle;
+const osThreadAttr_t Cal_JBC_attributes = {
+  .name = "Cal_JBC",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -125,6 +133,7 @@ void _ShootTask(void *argument);
 void motorControlTask(void *argument);
 void _UITask(void *argument);
 void _DaemonTask(void *argument);
+void _CalTask(void *argument);
 
 extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -183,6 +192,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of Daemon */
   DaemonHandle = osThreadNew(_DaemonTask, NULL, &Daemon_attributes);
 
+  /* creation of Cal_JBC */
+  Cal_JBCHandle = osThreadNew(_CalTask, NULL, &Cal_JBC_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -208,6 +220,7 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    USBRefreshTick();
     osDelay(1);
   }
   /* USER CODE END StartDefaultTask */
@@ -355,6 +368,24 @@ __weak void _DaemonTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END _DaemonTask */
+}
+
+/* USER CODE BEGIN Header__CalTask */
+/**
+* @brief Function implementing the Cal_JBC thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header__CalTask */
+__weak void _CalTask(void *argument)
+{
+  /* USER CODE BEGIN _CalTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END _CalTask */
 }
 
 /* Private application code --------------------------------------------------*/

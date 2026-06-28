@@ -44,7 +44,7 @@ static void HostOfflineCallback(void *instance)
     }
     else{
         LOGWARNING("[vision] vision offline, restart communication.");
-            USBRefresh();
+            // USBRefresh();
     }
 
 }
@@ -128,14 +128,6 @@ HostInstance *HostInit(HostInstanceConf *host_conf,uint8_t reload_count)
         USB_Init_Config_s usb_conf = {.rx_cbk = host_vcp_callbacks[idx]};
            _instance->comm_instance = USBInit(usb_conf);
     }
-    else
-    {
-        // while (1)
-        // LOGERROR("[master_process]You must select correct mode for HOST.");
-        (void)0;
-    }
-
-
 
     // 为上位机实例注册守护进程
     Daemon_Init_Config_s daemon_conf = {

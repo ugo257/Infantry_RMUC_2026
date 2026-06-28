@@ -3,12 +3,14 @@
 #include <string.h>
 
 #define CTRL_FLOAT_BASE_INDEX        2u
-#define CTRL_FLAGS_BASE_INDEX        (sizeof(Chassis_Ctrl_Cmd_s_uart) - 7u)
+#define CTRL_FLAGS_COUNT             10u
+#define CTRL_FLAGS_BASE_INDEX        (sizeof(Chassis_Ctrl_Cmd_s_uart) - CTRL_FLAGS_COUNT)
 #define CTRL_CHECKSUM_INDEX          (sizeof(Chassis_Ctrl_Cmd_s_uart) + 2u)
 
 #define UPLOAD_FLOAT_BASE_INDEX      2u
 #define UPLOAD_COLOR_INDEX           (UPLOAD_FLOAT_BASE_INDEX + 32u)
 #define UPLOAD_HOLE_YAW_READY_INDEX  (UPLOAD_COLOR_INDEX + 1u)
+#define UPLOAD_HOLE_OFFSET_TAKEOVER_INDEX (UPLOAD_HOLE_YAW_READY_INDEX + 1u)
 #define UPLOAD_CHECKSUM_INDEX        (sizeof(Chassis_Upload_Data_s_uart) + 2u)
 
 void UniCommFloatToBytes(float value, uint8_t *bytes)
@@ -176,6 +178,7 @@ uint16_t UniCommPackChassisCtrl(const Chassis_Ctrl_Cmd_s_uart *src, uint8_t *dst
     dst[CTRL_FLAGS_BASE_INDEX + 6u] = (uint8_t)src->load_mode;
     dst[CTRL_FLAGS_BASE_INDEX + 7u] = (uint8_t)src->chassis_mode;
     dst[CTRL_FLAGS_BASE_INDEX + 8u] = (uint8_t)src->gimbal_mode;
+    dst[CTRL_FLAGS_BASE_INDEX + 9u] = src->hole_offset_yaw_takeover;
 
     dst[CTRL_CHECKSUM_INDEX] = UniCommChecksum(dst, CTRL_CHECKSUM_INDEX);
     return UNICOMM_CTRL_FRAME_LEN;
@@ -214,6 +217,7 @@ bool UniCommUnpackChassisCtrl(const uint8_t *src, uint16_t src_len, Chassis_Ctrl
     dst->load_mode = (loader_mode_e)src[CTRL_FLAGS_BASE_INDEX + 6u];
     dst->chassis_mode = (chassis_mode_e)src[CTRL_FLAGS_BASE_INDEX + 7u];
     dst->gimbal_mode = (gimbal_mode_e)src[CTRL_FLAGS_BASE_INDEX + 8u];
+    dst->hole_offset_yaw_takeover = src[CTRL_FLAGS_BASE_INDEX + 9u];
     return true;
 }
 
@@ -238,6 +242,7 @@ uint16_t UniCommPackChassisUpload(const Chassis_Upload_Data_s_uart *src, uint8_t
 
     dst[UPLOAD_COLOR_INDEX] = (uint8_t)src->color;
     dst[UPLOAD_HOLE_YAW_READY_INDEX] = src->hole_yaw_ready;
+    dst[UPLOAD_HOLE_OFFSET_TAKEOVER_INDEX] = src->hole_offset_yaw_takeover;
     dst[UPLOAD_CHECKSUM_INDEX] = UniCommChecksum(dst, UPLOAD_CHECKSUM_INDEX);
     return UNICOMM_UPLOAD_FRAME_LEN;
 }
@@ -264,5 +269,6 @@ bool UniCommUnpackChassisUpload(const uint8_t *src, uint16_t src_len, Chassis_Up
     dst->yaw_motor_vel = UniCommBytesToFloat(src + UPLOAD_FLOAT_BASE_INDEX + 28u);
     dst->color = (version_color)src[UPLOAD_COLOR_INDEX];
     dst->hole_yaw_ready = src[UPLOAD_HOLE_YAW_READY_INDEX];
+    dst->hole_offset_yaw_takeover = src[UPLOAD_HOLE_OFFSET_TAKEOVER_INDEX];
     return true;
 }

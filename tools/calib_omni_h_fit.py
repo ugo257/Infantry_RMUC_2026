@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fit the omni H matrix from remote-control chassis logs.
+"""Fit the omni H matrix from chassis H-calibration logs.
 
 Input CSVs should be exported from g_omni_h_calib_record. The script uses
-run_id as the segment key, finds static windows inside each segment, removes
-IMU bias, integrates short body-frame acceleration, and fits:
+run_id as the segment key, merges optional standalone chassis-IMU CSV rows by
+sample_time_s, finds static windows inside each segment, removes IMU bias,
+integrates short body-frame acceleration, and fits:
 
     wheel_speed_fit = H_si * [vx_mps, vy_left_mps, wz_radps]
     [vx_mps, vy_left_mps, wz_radps] = cmd_to_si * [cmd_vx, cmd_vy_left, cmd_wz]
@@ -44,6 +45,16 @@ class Row:
 
 
 @dataclass
+class ImuSample:
+    t: float
+    body_acc_x: float
+    body_acc_y: float
+    body_acc_z: float
+    body_omega_z: float
+    body_yaw_total: float
+
+
+@dataclass
 class StaticWindow:
     start: int
     end: int
@@ -72,6 +83,10 @@ def parse_float(row: dict[str, str], *names: str, default: float = 0.0) -> float
         if value != "":
             return float(value)
     return default
+
+
+def has_float(row: dict[str, str], *names: str) -> bool:
+    return any(row.get(name, "") != "" for name in names)
 
 
 def parse_int(row: dict[str, str], *names: str, default: int = 0) -> int:
@@ -107,6 +122,112 @@ def row_time(row: dict[str, str], fallback_index: int) -> float:
         if value != "":
             return float(value)
     return fallback_index * 0.001
+
+
+def normalize_imu_row(row: dict[str, str], fallback_index: int) -> ImuSample:
+    t = row_time(row, fallback_index)
+
+    if has_float(row, "body_acc_x", "acc_x") and has_float(row, "body_acc_y", "acc_y"):
+        body_acc_x = parse_float(row, "body_acc_x", "acc_x")
+        body_acc_y = parse_float(row, "body_acc_y", "acc_y")
+        body_acc_z = parse_float(row, "body_acc_z", "acc_z", default=0.0)
+    elif has_float(row, "imu_acc_x") and has_float(row, "imu_acc_y"):
+        imu_acc_x = parse_float(row, "imu_acc_x")
+        imu_acc_y = parse_float(row, "imu_acc_y")
+        if has_float(row, "imu_forward_offset_rad"):
+            offset_rad = parse_float(row, "imu_forward_offset_rad")
+        else:
+            offset_rad = math.radians(parse_float(row, "imu_forward_offset_deg", default=0.0))
+        cos_o = math.cos(offset_rad)
+        sin_o = math.sin(offset_rad)
+        body_acc_x = cos_o * imu_acc_x - sin_o * imu_acc_y
+        body_acc_y = sin_o * imu_acc_x + cos_o * imu_acc_y
+        body_acc_z = parse_float(row, "imu_acc_z", default=0.0)
+    else:
+        raise ValueError("IMU CSV must provide body_acc_x/body_acc_y or imu_acc_x/imu_acc_y")
+
+    return ImuSample(
+        t=t,
+        body_acc_x=body_acc_x,
+        body_acc_y=body_acc_y,
+        body_acc_z=body_acc_z,
+        body_omega_z=parse_float(
+            row,
+            "body_omega_z",
+            "omega_z",
+            "imu_omega_z",
+            "yaw_rate",
+            "yaw_rate_rad_s",
+        ),
+        body_yaw_total=parse_float(
+            row,
+            "body_yaw_total",
+            "yaw_total",
+            "yaw_rad",
+            "body_yaw",
+            default=0.0,
+        ),
+    )
+
+
+def load_imu_samples(paths: list[str]) -> list[ImuSample]:
+    samples: list[ImuSample] = []
+    for path in discover_files(paths):
+        rows = read_csv(path)
+        for i, row in enumerate(rows):
+            samples.append(normalize_imu_row(row, i))
+    return sorted(samples, key=lambda item: item.t)
+
+
+def interpolate_imu(samples: list[ImuSample], t: float) -> ImuSample:
+    if not samples:
+        raise ValueError("no IMU samples loaded")
+    if len(samples) == 1 or t <= samples[0].t:
+        return samples[0]
+    if t >= samples[-1].t:
+        return samples[-1]
+
+    lo = 0
+    hi = len(samples) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if samples[mid].t <= t:
+            lo = mid
+        else:
+            hi = mid
+
+    a = samples[lo]
+    b = samples[hi]
+    ratio = 0.0 if b.t <= a.t else (t - a.t) / (b.t - a.t)
+
+    def lerp(v0: float, v1: float) -> float:
+        return v0 + (v1 - v0) * ratio
+
+    return ImuSample(
+        t=t,
+        body_acc_x=lerp(a.body_acc_x, b.body_acc_x),
+        body_acc_y=lerp(a.body_acc_y, b.body_acc_y),
+        body_acc_z=lerp(a.body_acc_z, b.body_acc_z),
+        body_omega_z=lerp(a.body_omega_z, b.body_omega_z),
+        body_yaw_total=lerp(a.body_yaw_total, b.body_yaw_total),
+    )
+
+
+def merge_imu_rows(rows: list[dict[str, str]], imu_samples: list[ImuSample]) -> list[dict[str, str]]:
+    if not imu_samples:
+        return rows
+
+    merged: list[dict[str, str]] = []
+    for i, row in enumerate(rows):
+        imu = interpolate_imu(imu_samples, row_time(row, i))
+        merged_row = dict(row)
+        merged_row["body_acc_x"] = f"{imu.body_acc_x:.9g}"
+        merged_row["body_acc_y"] = f"{imu.body_acc_y:.9g}"
+        merged_row["body_acc_z"] = f"{imu.body_acc_z:.9g}"
+        merged_row["body_omega_z"] = f"{imu.body_omega_z:.9g}"
+        merged_row["body_yaw_total"] = f"{imu.body_yaw_total:.9g}"
+        merged.append(merged_row)
+    return merged
 
 
 def row_dt(row: dict[str, str], t: float, last_t: float | None, max_dt: float) -> float:
@@ -288,6 +409,15 @@ def fit_run(
     rows = sorted(rows, key=lambda item: item.t)
     if len(rows) < 20:
         raise ValueError("not enough valid rows")
+    for item in rows:
+        if not (
+            has_float(item.raw, "body_acc_x", "acc_x")
+            and has_float(item.raw, "body_acc_y", "acc_y")
+            and has_float(item.raw, "body_omega_z", "omega_z")
+        ):
+            raise ValueError(
+                "missing IMU motion fields; pass --imu-csv with acc_x/acc_y/yaw_rate data"
+            )
 
     windows, static_flags = find_static_windows(
         rows,
@@ -465,6 +595,7 @@ def c_matrix_snippet(h_cmd: list[list[float]]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("csv", nargs="+", help="CSV files, globs, or directories")
+    parser.add_argument("--imu-csv", nargs="+", default=[], help="Standalone chassis IMU CSV files to merge by sample_time_s")
     parser.add_argument("--output", type=Path, default=Path("calib_omni_h_results.json"))
     parser.add_argument("--include-disabled", action="store_true", help="Also fit rows whose enable field is 0")
     parser.add_argument("--static-cmd", type=float, default=80.0, help="Max abs command considered static")
@@ -484,6 +615,7 @@ def main() -> int:
     files = discover_files(args.csv)
     if not files:
         raise SystemExit("no CSV files found")
+    imu_samples = load_imu_samples(args.imu_csv) if args.imu_csv else []
 
     all_samples: list[Sample] = []
     runs: list[dict[str, object]] = []
@@ -491,7 +623,7 @@ def main() -> int:
 
     for path in files:
         try:
-            rows = read_csv(path)
+            rows = merge_imu_rows(read_csv(path), imu_samples)
             groups = group_runs(path, rows, args.include_disabled, args.max_integrate_dt_s)
             if not groups:
                 errors[str(path)] = "no rows left after valid/enable filtering"
@@ -526,6 +658,7 @@ def main() -> int:
 
     result = {
         "sample_count": len(all_samples),
+        "imu_sample_count": len(imu_samples),
         "runs": runs,
         "axis_names": AXIS_NAMES,
         "wheel_names": WHEEL_NAMES,

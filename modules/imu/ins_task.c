@@ -87,6 +87,28 @@ static float g_gyro_z_bias_est_rad = 0.0f;
 static INS_StaticDetector_t g_static_detector = {0};
 static uint8_t g_ekf_initialized = 0u;
 
+#define IMU_BIAS_CALIB_DEFAULT_SAMPLE_TARGET 20000U
+#define IMU_BIAS_CALIB_DEFAULT_WARMUP_TICKS  1000U
+#define IMU_BIAS_CALIB_SAMPLE_TARGET_MAX     600000U
+#define IMU_BIAS_CALIB_WARMUP_TICKS_MAX      60000U
+
+volatile ImuBiasCalibCmd_s g_imu_bias_calib_cmd = {
+    .enable = 0u,
+    .start = 0u,
+    .abort = 0u,
+    .reserved = 0u,
+    .run_id = 0u,
+    .sample_target = IMU_BIAS_CALIB_DEFAULT_SAMPLE_TARGET,
+    .warmup_ticks = IMU_BIAS_CALIB_DEFAULT_WARMUP_TICKS,
+};
+
+volatile ImuBiasCalibRecord_s g_imu_bias_calib_record = {0};
+
+static ImuBiasCalibState_e g_imu_bias_calib_state = IMU_BIAS_CALIB_STATE_IDLE;
+static uint8_t g_imu_bias_calib_prev_start = 0u;
+static float g_imu_bias_calib_gyro_m2[3] = {0.0f, 0.0f, 0.0f};
+static float g_imu_bias_calib_acc_m2[3] = {0.0f, 0.0f, 0.0f};
+
 /* ----------------------------- 内部工具函数 ----------------------------- */
 
 static inline float INS_Clampf(float x, float min, float max)
@@ -313,6 +335,251 @@ void INS_EKF_SetCoreParams(float q1_pc, float q2_pc, float r_pc, float lambda_pc
     g_ins_ekf_param.r = r_pc;
     g_ins_ekf_param.lambda = lambda_pc;
     INS_EKF_ParamSanitize(&g_ins_ekf_param);
+}
+
+static void INS_ImuBiasCalibCopyOldOffsets(void)
+{
+    for (uint8_t i = 0u; i < 3u; i++)
+    {
+        g_imu_bias_calib_record.old_gyro_offset[i] = g_gyro_offset[i];
+        g_imu_bias_calib_record.old_acc_offset[i] = g_accel_offset[i];
+    }
+}
+
+static void INS_ImuBiasCalibClearStats(void)
+{
+    g_imu_bias_calib_record.sample_count = 0u;
+    g_imu_bias_calib_record.invalid_count = 0u;
+    g_imu_bias_calib_record.warmup_count = 0u;
+    g_imu_bias_calib_record.valid = 0u;
+    g_imu_bias_calib_record.done = 0u;
+    g_imu_bias_calib_record.abort_reason = IMU_BIAS_CALIB_ABORT_NONE;
+
+    for (uint8_t i = 0u; i < 3u; i++)
+    {
+        g_imu_bias_calib_record.gyro_mean_body_raw[i] = 0.0f;
+        g_imu_bias_calib_record.acc_mean_body_raw[i] = 0.0f;
+        g_imu_bias_calib_record.gyro_std_body_raw[i] = 0.0f;
+        g_imu_bias_calib_record.acc_std_body_raw[i] = 0.0f;
+        g_imu_bias_calib_gyro_m2[i] = 0.0f;
+        g_imu_bias_calib_acc_m2[i] = 0.0f;
+    }
+}
+
+static uint8_t INS_ImuBiasCalibTempReady(float temperature_c)
+{
+    return (uint8_t)(INS_IsFinitef(temperature_c) &&
+                     temperature_c >= BMI088_TEMP_READY_LOW_C &&
+                     temperature_c <= BMI088_TEMP_READY_HIGH_C);
+}
+
+static uint8_t INS_ImuBiasCalibSampleReady(void)
+{
+    return (uint8_t)(g_static_detector.candidate != 0u &&
+                     g_static_detector.is_static != 0u);
+}
+
+static uint8_t INS_ImuBiasCalibValuesValid(const float gyro_body_raw[3],
+                                           const float acc_body_raw[3],
+                                           float temperature_c)
+{
+    if (gyro_body_raw == NULL || acc_body_raw == NULL)
+    {
+        return 0u;
+    }
+
+    for (uint8_t i = 0u; i < 3u; i++)
+    {
+        if (!INS_IsFinitef(gyro_body_raw[i]) || !INS_IsFinitef(acc_body_raw[i]))
+        {
+            return 0u;
+        }
+    }
+
+    return INS_IsFinitef(temperature_c);
+}
+
+static void INS_ImuBiasCalibAbort(ImuBiasCalibAbortReason_e reason)
+{
+    g_imu_bias_calib_state = IMU_BIAS_CALIB_STATE_ABORT;
+    g_imu_bias_calib_record.state = IMU_BIAS_CALIB_STATE_ABORT;
+    g_imu_bias_calib_record.valid = 0u;
+    g_imu_bias_calib_record.done = 0u;
+    g_imu_bias_calib_record.abort_reason = (uint8_t)reason;
+}
+
+static void INS_ImuBiasCalibEnterIdle(ImuBiasCalibAbortReason_e reason)
+{
+    g_imu_bias_calib_state = IMU_BIAS_CALIB_STATE_IDLE;
+    g_imu_bias_calib_record.state = IMU_BIAS_CALIB_STATE_IDLE;
+    g_imu_bias_calib_record.valid = 0u;
+    g_imu_bias_calib_record.done = 0u;
+    g_imu_bias_calib_record.abort_reason = (uint8_t)reason;
+}
+
+static void INS_ImuBiasCalibStart(void)
+{
+    uint32_t sample_target = g_imu_bias_calib_cmd.sample_target;
+    uint32_t warmup_ticks = g_imu_bias_calib_cmd.warmup_ticks;
+
+    if (sample_target == 0u)
+    {
+        sample_target = IMU_BIAS_CALIB_DEFAULT_SAMPLE_TARGET;
+    }
+    if (warmup_ticks == 0u)
+    {
+        warmup_ticks = IMU_BIAS_CALIB_DEFAULT_WARMUP_TICKS;
+    }
+    if (sample_target > IMU_BIAS_CALIB_SAMPLE_TARGET_MAX ||
+        warmup_ticks > IMU_BIAS_CALIB_WARMUP_TICKS_MAX)
+    {
+        INS_ImuBiasCalibAbort(IMU_BIAS_CALIB_ABORT_BAD_PARAM);
+        return;
+    }
+
+    INS_ImuBiasCalibClearStats();
+    INS_ImuBiasCalibCopyOldOffsets();
+    g_imu_bias_calib_record.run_id = g_imu_bias_calib_cmd.run_id;
+    g_imu_bias_calib_record.sample_target = sample_target;
+    g_imu_bias_calib_record.warmup_ticks = warmup_ticks;
+    g_imu_bias_calib_state = IMU_BIAS_CALIB_STATE_WAIT_TEMP;
+    g_imu_bias_calib_record.state = IMU_BIAS_CALIB_STATE_WAIT_TEMP;
+}
+
+static void INS_ImuBiasCalibAddSample(const float gyro_body_raw[3],
+                                      const float acc_body_raw[3])
+{
+    uint32_t n;
+
+    g_imu_bias_calib_record.sample_count++;
+    n = g_imu_bias_calib_record.sample_count;
+
+    for (uint8_t i = 0u; i < 3u; i++)
+    {
+        float gyro_delta;
+        float gyro_delta2;
+        float acc_delta;
+        float acc_delta2;
+
+        gyro_delta = gyro_body_raw[i] - g_imu_bias_calib_record.gyro_mean_body_raw[i];
+        g_imu_bias_calib_record.gyro_mean_body_raw[i] += gyro_delta / (float)n;
+        gyro_delta2 = gyro_body_raw[i] - g_imu_bias_calib_record.gyro_mean_body_raw[i];
+        g_imu_bias_calib_gyro_m2[i] += gyro_delta * gyro_delta2;
+
+        acc_delta = acc_body_raw[i] - g_imu_bias_calib_record.acc_mean_body_raw[i];
+        g_imu_bias_calib_record.acc_mean_body_raw[i] += acc_delta / (float)n;
+        acc_delta2 = acc_body_raw[i] - g_imu_bias_calib_record.acc_mean_body_raw[i];
+        g_imu_bias_calib_acc_m2[i] += acc_delta * acc_delta2;
+
+        if (n > 1u)
+        {
+            g_imu_bias_calib_record.gyro_std_body_raw[i] =
+                INS_Sqrtf(g_imu_bias_calib_gyro_m2[i] / (float)(n - 1u));
+            g_imu_bias_calib_record.acc_std_body_raw[i] =
+                INS_Sqrtf(g_imu_bias_calib_acc_m2[i] / (float)(n - 1u));
+        }
+    }
+}
+
+static void INS_ImuBiasCalibUpdate(const float gyro_body_raw[3],
+                                   const float acc_body_raw[3],
+                                   float temperature_c)
+{
+    const uint8_t enable = g_imu_bias_calib_cmd.enable;
+    const uint8_t start = g_imu_bias_calib_cmd.start;
+    const uint8_t start_edge = (uint8_t)(enable != 0u &&
+                                         start != 0u &&
+                                         g_imu_bias_calib_prev_start == 0u);
+    const uint8_t temp_ready = INS_ImuBiasCalibTempReady(temperature_c);
+    const uint8_t static_ready = INS_ImuBiasCalibSampleReady();
+    const uint8_t values_valid =
+        INS_ImuBiasCalibValuesValid(gyro_body_raw, acc_body_raw, temperature_c);
+
+    g_imu_bias_calib_prev_start = (enable != 0u) ? start : 0u;
+    g_imu_bias_calib_record.sample_time_s = DWT_GetTimeline_s();
+    g_imu_bias_calib_record.temperature_c = temperature_c;
+    g_imu_bias_calib_record.gyro_norm_dps = INS_Vec3Norm(gyro_body_raw) * RAD_TO_ANGLE;
+    g_imu_bias_calib_record.acc_norm_mps2 = INS_Vec3Norm(acc_body_raw);
+    INS_ImuBiasCalibCopyOldOffsets();
+
+    if (enable == 0u)
+    {
+        INS_ImuBiasCalibEnterIdle((g_imu_bias_calib_state == IMU_BIAS_CALIB_STATE_IDLE) ?
+                                      IMU_BIAS_CALIB_ABORT_NONE :
+                                      IMU_BIAS_CALIB_ABORT_DISABLED);
+        return;
+    }
+
+    if (g_imu_bias_calib_cmd.abort != 0u)
+    {
+        INS_ImuBiasCalibAbort(IMU_BIAS_CALIB_ABORT_USER);
+        return;
+    }
+
+    if (start_edge != 0u)
+    {
+        INS_ImuBiasCalibStart();
+    }
+
+    switch (g_imu_bias_calib_state)
+    {
+    case IMU_BIAS_CALIB_STATE_WAIT_TEMP:
+        if (temp_ready != 0u)
+        {
+            g_imu_bias_calib_state = IMU_BIAS_CALIB_STATE_WARMUP;
+            g_imu_bias_calib_record.state = IMU_BIAS_CALIB_STATE_WARMUP;
+        }
+        break;
+
+    case IMU_BIAS_CALIB_STATE_WARMUP:
+        if (temp_ready != 0u && static_ready != 0u && values_valid != 0u)
+        {
+            if (g_imu_bias_calib_record.warmup_count < g_imu_bias_calib_record.warmup_ticks)
+            {
+                g_imu_bias_calib_record.warmup_count++;
+            }
+            if (g_imu_bias_calib_record.warmup_count >= g_imu_bias_calib_record.warmup_ticks)
+            {
+                g_imu_bias_calib_state = IMU_BIAS_CALIB_STATE_SAMPLE;
+                g_imu_bias_calib_record.state = IMU_BIAS_CALIB_STATE_SAMPLE;
+            }
+        }
+        else
+        {
+            g_imu_bias_calib_record.invalid_count++;
+        }
+        break;
+
+    case IMU_BIAS_CALIB_STATE_SAMPLE:
+        if (temp_ready != 0u && static_ready != 0u && values_valid != 0u)
+        {
+            INS_ImuBiasCalibAddSample(gyro_body_raw, acc_body_raw);
+            if (g_imu_bias_calib_record.sample_count >= g_imu_bias_calib_record.sample_target)
+            {
+                g_imu_bias_calib_state = IMU_BIAS_CALIB_STATE_DONE;
+                g_imu_bias_calib_record.state = IMU_BIAS_CALIB_STATE_DONE;
+                g_imu_bias_calib_record.valid = 1u;
+                g_imu_bias_calib_record.done = 1u;
+                g_imu_bias_calib_record.abort_reason = IMU_BIAS_CALIB_ABORT_NONE;
+            }
+        }
+        else
+        {
+            g_imu_bias_calib_record.invalid_count++;
+        }
+        break;
+
+    case IMU_BIAS_CALIB_STATE_DONE:
+        g_imu_bias_calib_record.valid = 1u;
+        g_imu_bias_calib_record.done = 1u;
+        break;
+
+    case IMU_BIAS_CALIB_STATE_ABORT:
+    case IMU_BIAS_CALIB_STATE_IDLE:
+    default:
+        g_imu_bias_calib_record.state = (uint8_t)g_imu_bias_calib_state;
+        break;
+    }
 }
 
 /**
@@ -554,6 +821,8 @@ void INS_EKF(void)
     static float last_yaw_total_deg = 0.0f;
     float candidate_angle_deg[3];
     float public_angle_deg[3];
+    float gyro_body_raw[3];
+    float acc_body_raw[3];
     float dt;
 
     if (INS == NULL || INS->BMI088 == NULL)
@@ -578,6 +847,11 @@ void INS_EKF(void)
                            INS->INS_data.INS_accel,
                            INS->INS_data.INS_mag,
                            &raw_data);
+    for (uint8_t i = 0u; i < 3u; i++)
+    {
+        gyro_body_raw[i] = INS->INS_data.INS_gyro[i] + g_gyro_offset[i];
+        acc_body_raw[i] = INS->INS_data.INS_accel[i] + g_accel_offset[i];
+    }
     INS_UpdateAccelLpf(INS->INS_data.INS_accel);
     dt = DWT_GetDeltaT(&INS->BMI088->bias_dwt_cnt);
     if (!INS_IsFinitef(dt) || dt <= 0.0f)
@@ -588,6 +862,7 @@ void INS_EKF(void)
     INS->timing_time = dt;
 
     INS_EKF_UpdateStaticDetector(dt);
+    INS_ImuBiasCalibUpdate(gyro_body_raw, acc_body_raw, raw_data.temperature);
     INS_EKF_UpdateGyroZBias(dt);
     IMU_QuaternionEKF_Update(INS->INS_data.INS_gyro[INS_ROLL_ADDRESS_OFFSET],
                              INS->INS_data.INS_gyro[INS_PITCH_ADDRESS_OFFSET],

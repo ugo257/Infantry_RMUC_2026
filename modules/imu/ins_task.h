@@ -33,6 +33,62 @@ typedef struct INS_Instance
     float timing_time;      // 本次解算周期，单位 s
 } INS_Instance;
 
+typedef enum
+{
+    IMU_BIAS_CALIB_STATE_IDLE = 0,
+    IMU_BIAS_CALIB_STATE_WAIT_TEMP = 1,
+    IMU_BIAS_CALIB_STATE_WARMUP = 2,
+    IMU_BIAS_CALIB_STATE_SAMPLE = 3,
+    IMU_BIAS_CALIB_STATE_DONE = 4,
+    IMU_BIAS_CALIB_STATE_ABORT = 5,
+} ImuBiasCalibState_e;
+
+typedef enum
+{
+    IMU_BIAS_CALIB_ABORT_NONE = 0,
+    IMU_BIAS_CALIB_ABORT_DISABLED = 1,
+    IMU_BIAS_CALIB_ABORT_USER = 2,
+    IMU_BIAS_CALIB_ABORT_BAD_PARAM = 3,
+} ImuBiasCalibAbortReason_e;
+
+typedef struct
+{
+    uint8_t enable;       // 1 允许 Ozone 触发一次 IMU 静态偏置采集
+    uint8_t start;        // 上升沿启动；保持为 1 不会重复启动
+    uint8_t abort;        // 1 立即中止当前采集
+    uint8_t reserved;
+    uint32_t run_id;      // 手动设置，用于 CSV 分组
+    uint32_t sample_target; // 目标有效样本数；0 使用默认 20000
+    uint32_t warmup_ticks;  // SAMPLE 前静止预热 tick；0 使用默认 1000
+} ImuBiasCalibCmd_s;
+
+typedef struct
+{
+    uint32_t run_id;
+    uint8_t state;        // ImuBiasCalibState_e
+    uint8_t valid;        // 1 表示 done 行可用于拟合
+    uint8_t done;         // 1 表示本次采集完成
+    uint8_t abort_reason; // ImuBiasCalibAbortReason_e
+    uint32_t sample_count;
+    uint32_t invalid_count;
+    uint32_t sample_target;
+    uint32_t warmup_ticks;
+    uint32_t warmup_count;
+    float sample_time_s;
+    float temperature_c;
+    float gyro_mean_body_raw[3]; // 安装矩阵后的未扣偏置 gyro，单位 rad/s
+    float acc_mean_body_raw[3];  // 安装矩阵后的未扣偏置 acc，单位 m/s^2
+    float gyro_std_body_raw[3];
+    float acc_std_body_raw[3];
+    float gyro_norm_dps;         // 当前 body raw gyro 模长，单位 deg/s
+    float acc_norm_mps2;         // 当前 body raw acc 模长，单位 m/s^2
+    float old_gyro_offset[3];
+    float old_acc_offset[3];
+} ImuBiasCalibRecord_s;
+
+extern volatile ImuBiasCalibCmd_s g_imu_bias_calib_cmd;
+extern volatile ImuBiasCalibRecord_s g_imu_bias_calib_record;
+
 /**
  * @brief 初始化惯导解算实例。
  * @param bmi088 已注册并完成基础初始化的 BMI088 实例

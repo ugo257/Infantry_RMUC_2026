@@ -4,7 +4,7 @@
 #include "bsp_log.h"
 #include "power_calc.h"
 #include <stdint.h>
-#include "power_calc.h"
+#include <string.h>
 #include "robot_board.h"
 static uint8_t idx = 0; // register idx,是该文件的全局电机索引,在注册时使用
 /* DJI电机的实例,此处仅保存指针,内存的分配将通过电机实例初始化时通过malloc()进行 */
@@ -14,7 +14,16 @@ float speed =-1.0;
 float kp_t=1.0;
 float tff=-10.0;
 Power_Data_s power_data; // 电机功率数据
+#if defined(CHASSIS_BOARD)
+#define DJI_CHASSIS_POWER_GROUP 4U
+#define DJI_CHASSIS_POWER_MOTOR_MASK 0x0FU
+#define DJI_CHASSIS_CURRENT_SLEW_RATE_CMD_PER_S 500000.0f
+#define DJI_CHASSIS_CURRENT_SLEW_DEFAULT_DT_S 0.001f
+#define DJI_CHASSIS_CURRENT_SLEW_MAX_DT_S 0.005f
+#endif
+#ifndef M_PI
 #define M_PI 3.14159265358979323846f // 定义圆周率常量,用于角度转弧度的转换
+#endif
 /**
  * @brief 由于DJI电机发送以四个一组的形式进行,故对其进行特殊处理,用6个(2can*3group)can_instance专门负责发送
  *        该变量将在 DJIMotorControl() 中使用,分组在 MotorSenderGrouping()中进行
@@ -174,10 +183,6 @@ static void DJIMotorLostCallback(void *motor_ptr)
 {
     DJIMotorInstance *motor = (DJIMotorInstance *)motor_ptr;
     uint16_t can_bus        = motor->motor_can_instance->can_handle == &hcan1 ? 1 : 2;
-    // HAL_CAN_Stop(motor->motor_can_instance->can_handle);
-    // HAL_CAN_ActivateNotification(motor->motor_can_instance->can_handle, CAN_IT_RX_FIFO0_MSG_PENDING|CAN_IT_RX_FIFO1_MSG_PENDING);
-    // HAL_CAN_Start(motor->motor_can_instance->can_handle);
-    
     LOGWARNING("[dji_motor] Motor lost, can bus [%d] , id [%d]", can_bus, motor->motor_can_instance->tx_id);
 }
 // static uint8_t DM_ready=0;
@@ -213,7 +218,7 @@ DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config)
     Daemon_Init_Config_s daemon_config = {
         .callback     = DJIMotorLostCallback,
         .owner_id     = instance,
-        .reload_count = 2, // 20ms未收到数据则丢失
+        .reload_count = 20, // 20ms未收到数据则丢失
     };
     instance->daemon = DaemonRegister(&daemon_config);
 
@@ -281,16 +286,84 @@ int IfCANTransmit;
 uint8_t group, num,ys; // 电机组号和组内编号
 float motorset[4];float pid_measure, pid_ref;             // 电机PID测量值和设定值
 
+#if defined(CHASSIS_BOARD)
+static float chassis_current_slew_state[4] = {0.0f};
+static uint32_t chassis_current_slew_dwt_cnt = 0U;
+
+static float DJIMotorClampFloat(float value, float min_value, float max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static float DJIMotorChassisCurrentSlewDt(void)
+{
+    float dt = DWT_GetDeltaT(&chassis_current_slew_dwt_cnt);
+
+    if (dt <= 0.0f || dt > DJI_CHASSIS_CURRENT_SLEW_MAX_DT_S) {
+        dt = DJI_CHASSIS_CURRENT_SLEW_DEFAULT_DT_S;
+    }
+    return dt;
+}
+
+static int16_t DJIMotorApplyChassisCurrentSlew(uint8_t num, float target, float dt)
+{
+    const float max_step =
+        DJI_CHASSIS_CURRENT_SLEW_RATE_CMD_PER_S * dt;
+    float delta;
+
+    if (num >= 4U) {
+        return (int16_t)target;
+    }
+
+    delta = target - chassis_current_slew_state[num];
+    delta = DJIMotorClampFloat(delta, -max_step, max_step);
+    chassis_current_slew_state[num] += delta;
+    chassis_current_slew_state[num] =
+        DJIMotorClampFloat(chassis_current_slew_state[num], -16384.0f, 16384.0f);
+    return (int16_t)chassis_current_slew_state[num];
+}
+
+static void DJIMotorResetChassisCurrentSlew(uint8_t num)
+{
+    if (num < 4U) {
+        chassis_current_slew_state[num] = 0.0f;
+    }
+}
+
+static void DJIMotorPackCurrentToBuff(uint8_t group, uint8_t num, int16_t set)
+{
+    sender_assignment[group].tx_buff[2 * num]     = (uint8_t)(set >> 8);
+    sender_assignment[group].tx_buff[2 * num + 1] = (uint8_t)(set & 0x00ff);
+}
+#endif
+
 // 为所有电机实例计算三环PID,发送控制报文
 void DJIMotorControl()
 {
     // 直接保存一次指针引用从而减小访存的开销,同样可以提高可读性
-    
+
     int16_t set;        // 电机控制CAN发送设定值
     DJIMotorInstance *motor;
     Motor_Control_Setting_s *motor_setting; // 电机控制参数
     Motor_Controller_s *motor_controller;   // 电机控制器
     DJI_Motor_Measure_s *measure;           // 电机测量值
+#if defined(CHASSIS_BOARD)
+    uint8_t chassis_power_motor_mask = 0U;
+    const float chassis_current_slew_dt = DJIMotorChassisCurrentSlewDt();
+
+    power_data.count = 0U;
+    for (uint8_t i = 0U; i < 4U; ++i) {
+        power_data.input_power[i] = 0.0f;
+        power_data.wheel_speed[i] = 0.0f;
+        power_data.predict_output[i] = 0.0f;
+    }
+#endif
     
 
     // 遍历所有电机实例,进行串级PID的计算并设置发送报文的值
@@ -344,6 +417,10 @@ void DJIMotorControl()
 #ifdef SAMPLING
         set = (int16_t)motor_controller->pid_ref;
 #endif
+        if (motor->stop_flag == MOTOR_STOP) {
+            set = 0;
+            pid_ref = 0.0f;
+        }
 
         // 分组填入发送数据
         group                                         = motor->sender_group;
@@ -351,33 +428,50 @@ void DJIMotorControl()
         sender_assignment[group].tx_buff[2 * num]     = (uint8_t)(set >> 8);     // 低八位
         sender_assignment[group].tx_buff[2 * num + 1] = (uint8_t)(set & 0x00ff); // 高八位
 #if defined(CHASSIS_BOARD)
-        if (group == 1) {
-            if (power_data.count > 3) {
-                power_data.count = 0;
-            }
-            power_data.input_power[power_data.count]    =PowerInputCalc(motor->measure.speed_rpm, motor->motor_controller.speed_PID.Output);
-            power_data.wheel_speed[power_data.count]    = motor->measure.speed_rpm;
-            power_data.predict_output[power_data.count] = pid_ref;
+        if (group == DJI_CHASSIS_POWER_GROUP && num < 4U) {
+            power_data.input_power[num]    =
+                (motor->stop_flag == MOTOR_STOP) ? 0.0f : PowerInputCalc(motor->measure.speed_rpm, pid_ref);
+            power_data.wheel_speed[num]    = motor->measure.speed_rpm;
+            power_data.predict_output[num] = pid_ref;
+            chassis_power_motor_mask |= (uint8_t)(1U << num);
             power_data.count++;
-            
         }
 #endif
         // 若该电机处于停止状态,直接将buff置零
-        if (motor->stop_flag == MOTOR_STOP)
-            memset(sender_assignment[group].tx_buff + 2 * num, 0, 16u);
-    }
-    
+        if (motor->stop_flag == MOTOR_STOP) {
+            sender_assignment[group].tx_buff[2 * num] = 0U;
+            sender_assignment[group].tx_buff[2 * num + 1] = 0U;
 #if defined(CHASSIS_BOARD)
-int index = 0;
-    // if (dji_motor_instance[index]->stop_flag == MOTOR_ENABLED) {
-    //     power_data.total_power = TotalPowerCalc(power_data.input_power);
-    //     for (int i = 0; i < 4; i++) {
-    //         set                                     = CurrentOutputCalc(power_data.input_power[i], power_data.wheel_speed[i], power_data.predict_output[i]);
-    //         sender_assignment[1].tx_buff[2 * i]     = (uint8_t)(set >> 8);     // 低八位
-    //         sender_assignment[1].tx_buff[2 * i + 1] = (uint8_t)(set & 0x00ff); // 高八位
-    //         motorset[i]                             = set;
-    //     }
-    // }
+            if (group == DJI_CHASSIS_POWER_GROUP && num < 4U) {
+                DJIMotorResetChassisCurrentSlew(num);
+            }
+#endif
+        }
+    }
+
+#if defined(CHASSIS_BOARD)
+    power_data.total_power = TotalPowerCalc(power_data.input_power);
+    if (chassis_power_motor_mask == DJI_CHASSIS_POWER_MOTOR_MASK) {
+        for (uint8_t i = 0U; i < 4U; ++i) {
+            set = (int16_t)CurrentOutputCalc(power_data.input_power[i],
+                                             power_data.wheel_speed[i],
+                                             power_data.predict_output[i]);
+            set = DJIMotorApplyChassisCurrentSlew(i, (float)set, chassis_current_slew_dt);
+            DJIMotorPackCurrentToBuff(DJI_CHASSIS_POWER_GROUP, i, set);
+            motorset[i] = set;
+        }
+    } else {
+        for (uint8_t i = 0U; i < 4U; ++i) {
+            if ((chassis_power_motor_mask & (uint8_t)(1U << i)) == 0U) {
+                continue;
+            }
+            set = DJIMotorApplyChassisCurrentSlew(i,
+                                                  power_data.predict_output[i],
+                                                  chassis_current_slew_dt);
+            DJIMotorPackCurrentToBuff(DJI_CHASSIS_POWER_GROUP, i, set);
+            motorset[i] = set;
+        }
+    }
 #endif
 
 #if defined(CHASSIS_BOARD)

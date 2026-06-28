@@ -48,6 +48,7 @@ typedef struct
     ext_event_data_t EventData;                            // 0x0101
     ext_supply_projectile_action_t SupplyProjectileAction; // 0x0102
     ext_referee_warning_t referee_warning;                  //0x104
+    dart_info_t DartInfo;                                  // 0x0105
     ext_game_robot_state_t GameRobotState;                 // 0x0201
     ext_power_heat_data_t PowerHeatData;                   // 0x0202
     ext_game_robot_pos_t GameRobotPos;                     // 0x0203
@@ -57,6 +58,11 @@ typedef struct
     ext_shoot_data_t ShootData;                            // 0x0207
     projectile_allowance_t ProjectileAllowance;            // 0x0208
     RFID_state_t RFID_state;                               // 0x0209
+    dart_client_cmd_t DartClientCmd;                        // 0x020A
+    ground_robot_position_t GroundRobotPosition;            // 0x020B
+    radar_mark_data_t RadarMarkData;                        // 0x020C
+    sentry_info_t SentryInfo;                               // 0x020D
+    radar_info_t RadarInfo;                                 // 0x020E
     // 自定义交互数据的接收
     Communicate_ReceiveData_t ReceiveData;
 

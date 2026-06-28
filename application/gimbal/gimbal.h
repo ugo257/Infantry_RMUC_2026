@@ -13,7 +13,7 @@ void GimbalInit();
  */
 void GimbalTask_YAW(); //底盘板
 void GimbalTask_PITCH();//云台板
-
+void GimbalTask();
 extern volatile float test_yaw_ref;
 extern volatile float yaw_fit_time_s;
 extern volatile float yaw_angle_rad;

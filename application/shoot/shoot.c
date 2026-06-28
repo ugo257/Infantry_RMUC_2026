@@ -28,17 +28,65 @@ int32_t shoot_count;                     // 已发弹量
 #define DEBOUNCE_DELAY_MS 50             // 消抖延迟时间，单位：毫秒
 #define BUTTON_PRESSED    GPIO_PIN_RESET // 按键按下时引脚电平，通常为低电平
 #define BUTTON_RELEASED   GPIO_PIN_SET   // 按键释放时引脚电平，通常为高电平
-#define LOADER_MD_SPEED_KP_RAW_PER_DEG_S 0.07146f
-#define LOADER_MD_SPEED_KI_RAW_PER_DEG_S 0.07760f
-#define LOADER_MD_ANGLE_KP               80.0f
-#define LOADER_MD_ANGLE_KD               3.0f
-#define LOADER_MD_RPM_PER_HZ             270.0f
-#define LOADER_MD_DEG_S_PER_RPM          6.0f
-#define LOADER_MD_SPEED_LIMIT_RPM        20568.0f
-#define LOADER_MD_GEAR_RATIO             36.0f
+#define LOADER_MD_CURRENT_RAW_PER_A       1000.0f
+#define LOADER_MD_SPEED_MODEL_K_RPM_PER_A 20569.610f
+#define LOADER_MD_SPEED_MODEL_T_S         0.920872f
+#define LOADER_MD_SPEED_MODEL_L_S         0.054415f
+#define LOADER_MD_DEFAULT_LAMBDA_S        0.025f
+#define LOADER_MD_MIN_LAMBDA_S            0.05f
+#define LOADER_MD_DEG_S_PER_RPM           6.0f
+#define LOADER_MD_RPM_PER_HZ              270.0f
+#define LOADER_MD_FIXED_BURST_RATE_HZ     16.0f
+#define LOADER_MD_SPEED_LIMIT_RPM         20568.0f
+#define LOADER_MD_GEAR_RATIO              36.0f
+#define LOADER_MD_SPEED_KP_RAW_PER_DEG_S  0.16f
+#define LOADER_MD_SPEED_KI_RAW_PER_DEG_S  0.18f
+#define LOADER_MD_ANGLE_KP                40.0f
+#define LOADER_MD_ANGLE_KD                1.0f
+#define LOADER_STALL_CURRENT_FILTER_WINDOW 16U
+#define LOADER_STALL_CURRENT_THRESHOLD_RAW 5000.0f
+#define LOADER_STALL_CONFIRM_COUNT        1U
+#define LOADER_STALL_REVERSE_TOL_OUTPUT_DEG 1.0f
 #define LOADER_REVERSE_OUTPUT_ANGLE_DEG_DEFAULT 5.0f
+#define LOADER_REVERSE_AUTO_EXIT_TIME_MS 1500U
+#define LOADER_BURST_CURRENT_FEEDFORWARD_RAW 600.0f
 int load_speed           = 15000;
-float shoot_speed_target = 36000, shoot2_speed_target = 36000, limit_speed_target = 400;
+float shoot_speed_target = 37000, shoot2_speed_target = 36000, limit_speed_target = 400;
+#define SHOOT_INITIAL_SPEED_LOW_MPS        22.0f
+#define SHOOT_INITIAL_SPEED_HIGH_MPS       24.0f
+#define SHOOT_INITIAL_SPEED_CHANGE_EPS_MPS 0.01f
+#define SHOOT_SPEED_TARGET_STEP            10.0f
+
+static void ShootUpdateSpeedTargetByInitialSpeed(float initial_speed)
+{
+    static float last_initial_speed = 0.0f;
+    static uint8_t has_last_initial_speed = 0U;
+    float speed_delta;
+
+    if (initial_speed <= 0.0f) {
+        return;
+    }
+
+    if (has_last_initial_speed != 0U) {
+        speed_delta = initial_speed - last_initial_speed;
+        if (speed_delta < 0.0f) {
+            speed_delta = -speed_delta;
+        }
+
+        if (speed_delta <= SHOOT_INITIAL_SPEED_CHANGE_EPS_MPS) {
+            return;
+        }
+    }
+
+    last_initial_speed = initial_speed;
+    has_last_initial_speed = 1U;
+
+    if (initial_speed < SHOOT_INITIAL_SPEED_LOW_MPS) {
+        shoot_speed_target += SHOOT_SPEED_TARGET_STEP;
+    } else if (initial_speed > SHOOT_INITIAL_SPEED_HIGH_MPS) {
+        shoot_speed_target -= SHOOT_SPEED_TARGET_STEP;
+    }
+}
 // 定义按键状态
 typedef enum {
     BUTTON_STATE_IDLE,     // 按键未按下状态
@@ -148,6 +196,11 @@ typedef struct {
     float i_eso_out;
 } FrictionEso_t;
 
+typedef enum {
+    LOADER_STALL_STATE_NORMAL = 0U,
+    LOADER_STALL_STATE_REVERSE,
+} LoaderStallState_e;
+
 /* The two floats the DJI driver's current_feedforward_ptr will read each tick. */
 float friction_feedforward_l = 0.0f;
 float friction_feedforward_r = 0.0f;
@@ -191,24 +244,36 @@ static float friction_r_speed_ki = 0.0f;
  * setpoint is the angle PI output, exposed as loader->motor_controller.speed_PID.Ref
  * after each PIDCalculate (controller.c:178). When that magnitude is below
  * LOADER_REF_EPS the gate forces pure-P and skips ESO comp, matching the request
- * "目标速度=0 时取消补偿并只用纯P". */
+ * "目标速度=0 时取消补偿并只用纯P".
+ * Default off while validating the loader jam/reverse path. */
 float loader_feedforward = 0.0f;
 
 static FrictionEso_t loader_eso = {
     .b0 = 1.0f, .k_obs = 4.0f, .i_eso_max = 4000.0f, .reach_ratio = 0.8f,
-    .enable = 1, .comp_enable = 0,
+    .enable = 0, .comp_enable = 0,
     .z1 = 0.0f, .z2 = 0.0f,
     .wo = 0.0f, .beta1 = 0.0f, .beta2 = 0.0f,
     .i_eso_out = 0.0f,
 };
 
-/* User-intended Ki for the loader speed loop. Mirrored into speed_PID.Ki while
- * |loader.speed_PID.Ref| >= LOADER_REF_EPS; forced to 0 (pure-P) otherwise.
- * Seeded from the init-config value so behaviour matches the bare PI until the
- * user retunes via debugger. Tune THIS variable, not speed_PID.Ki directly. */
-static float loader_speed_ki = LOADER_MD_SPEED_KI_RAW_PER_DEG_S;
-
 #define LOADER_REF_EPS 1.0f  /* (deg/s, motor side) speed-Ref magnitude treated as "0" */
+
+/* Ozone observation values for loader speed PI, unit: raw current command per deg/s.
+ * Runtime no longer rewrites speed_PID.Ki; tune loader->motor_controller.speed_PID
+ * directly in Ozone when needed. */
+volatile float loader_speed_kp_raw_per_deg_s = LOADER_MD_SPEED_KP_RAW_PER_DEG_S;
+volatile float loader_speed_ki_raw_per_deg_s = LOADER_MD_SPEED_KI_RAW_PER_DEG_S;
+
+static float loader_stall_current_filter_buf[LOADER_STALL_CURRENT_FILTER_WINDOW];
+static float loader_stall_current_filter_sum = 0.0f;
+static uint8_t loader_stall_current_filter_index = 0U;
+static uint8_t loader_stall_current_filter_count = 0U;
+static uint8_t loader_stall_over_current_count = 0U;
+static float loader_stall_reverse_start_angle_deg = 0.0f;
+static float loader_stall_reverse_direction = -1.0f;
+volatile uint8_t loader_stall_state = LOADER_STALL_STATE_NORMAL;
+volatile float loader_stall_filtered_current = 0.0f;
+volatile float loader_stall_reverse_error_deg = 0.0f;
 
 DJIMotorInstance *loader;
 
@@ -225,8 +290,8 @@ void ShootInit()
         },
         .controller_param_init_config = {
             .speed_PID = {
-                .Kp            = 0.3,
-                .Ki            = 0,
+                .Kp            = 1.0,
+                .Ki            = 1.0,
                 .Kd            = 0,
                 .Improve       = PID_Integral_Limit,
                 .IntegralLimit = 15000,
@@ -379,12 +444,11 @@ float Block_Status;            // 拨弹盘状态
 //     }
 // }
 
-int heat_control    = 25; // 热量控制
-float local_heat    = 0;  // 本地热量
-int One_bullet_heat = 10; // 打一发消耗热量
+int heat_control    = 25; // 兼容旧反馈接口，当前不再参与本地热量判断
+float local_heat    = 0;  // 兼容旧反馈接口，当前不再作为有效热量状态
 
-// 热量控制算法
-static void Shoot_Fric_data_process(void)
+// 通过摩擦轮速度跌落/恢复沿统计本地发弹数
+static void ShootBulletCountProcess(void)
 {
     /*----------------------------------变量常量------------------------------------------*/
     static bool bullet_waiting_confirm = false; // 等待比较器确认
@@ -426,8 +490,7 @@ static void Shoot_Fric_data_process(void)
             bullet_waiting_confirm = true;
         } else if (derivative > 30) {
             if (bullet_waiting_confirm == true) {
-                local_heat += One_bullet_heat; // 确认打出
-                shoot_count++;
+                shoot_count++; // 确认打出一发，只更新本地计数
                 bullet_waiting_confirm = false;
             }
         }
@@ -471,6 +534,12 @@ volatile uint8_t loader_burst_speed_mode_active = 0U;
 volatile float loader_reverse_target_angle_deg = 0.0f;
 volatile float loader_reverse_angle_output_deg = LOADER_REVERSE_OUTPUT_ANGLE_DEG_DEFAULT;
 volatile float loader_reverse_angle_motor_deg = LOADER_REVERSE_OUTPUT_ANGLE_DEG_DEFAULT * LOADER_MD_GEAR_RATIO;
+volatile uint8_t loader_reverse_auto_active = 0U;
+volatile uint8_t loader_reverse_auto_suppress = 0U;
+volatile uint32_t loader_reverse_auto_elapsed_ms = 0U;
+volatile uint8_t loader_reverse_restore_mode_watch = LOAD_STOP;
+static uint32_t loader_reverse_auto_start_ms = 0U;
+static loader_mode_e loader_reverse_restore_mode = LOAD_STOP;
 
 loader_mode_e last_mode;
 // friction_mode_e friction_text_mode = FRICTION_OFF;
@@ -534,6 +603,173 @@ static void FrictionEso_GateByReach(FrictionEso_t *eso, float speed_meas, float 
     }
 }
 
+static float LoaderAbsFloat(float value)
+{
+    return (value >= 0.0f) ? value : -value;
+}
+
+static void LoaderResetSpeedPi(void)
+{
+    loader->motor_controller.speed_PID.ITerm = 0.0f;
+    loader->motor_controller.speed_PID.Iout  = 0.0f;
+    loader->motor_controller.speed_PID.Output = 0.0f;
+}
+
+static void LoaderUpdateSpeedPiWatch(void)
+{
+    loader_speed_kp_raw_per_deg_s = loader->motor_controller.speed_PID.Kp;
+    loader_speed_ki_raw_per_deg_s = loader->motor_controller.speed_PID.Ki;
+}
+
+static void LoaderResetStallCurrentFilter(void)
+{
+    loader_stall_current_filter_sum = 0.0f;
+    loader_stall_current_filter_index = 0U;
+    loader_stall_current_filter_count = 0U;
+    loader_stall_filtered_current = 0.0f;
+
+    for (uint8_t i = 0U; i < LOADER_STALL_CURRENT_FILTER_WINDOW; i++) {
+        loader_stall_current_filter_buf[i] = 0.0f;
+    }
+}
+
+static float LoaderFilterStallCurrent(float raw_current)
+{
+    uint8_t write_index = loader_stall_current_filter_index;
+
+    loader_stall_current_filter_sum -= loader_stall_current_filter_buf[write_index];
+    loader_stall_current_filter_buf[write_index] = raw_current;
+    loader_stall_current_filter_sum += raw_current;
+
+    write_index++;
+    if (write_index >= LOADER_STALL_CURRENT_FILTER_WINDOW) {
+        write_index = 0U;
+    }
+    loader_stall_current_filter_index = write_index;
+
+    if (loader_stall_current_filter_count < LOADER_STALL_CURRENT_FILTER_WINDOW) {
+        loader_stall_current_filter_count++;
+    }
+
+    loader_stall_filtered_current =
+        loader_stall_current_filter_sum / (float)loader_stall_current_filter_count;
+    return loader_stall_filtered_current;
+}
+
+static void LoaderResetStallProtection(void)
+{
+    loader_stall_state = LOADER_STALL_STATE_NORMAL;
+    loader_stall_over_current_count = 0U;
+    loader_stall_reverse_error_deg = 0.0f;
+    LoaderResetStallCurrentFilter();
+}
+
+static void LoaderStartTimedReverse(loader_mode_e restore_mode)
+{
+    loader_reverse_auto_active = 1U;
+    loader_reverse_auto_elapsed_ms = 0U;
+    loader_reverse_auto_start_ms = DWT_GetTimeline_ms();
+
+    if (restore_mode == LOAD_REVERSE) {
+        restore_mode = LOAD_STOP;
+    }
+    loader_reverse_restore_mode = restore_mode;
+    loader_reverse_restore_mode_watch = (uint8_t)restore_mode;
+}
+
+static void LoaderStopTimedReverse(void)
+{
+    loader_reverse_auto_active = 0U;
+    loader_reverse_auto_elapsed_ms = 0U;
+    loader_reverse_auto_start_ms = 0U;
+}
+
+static uint8_t LoaderTimedReverseExpired(void)
+{
+    if (!loader_reverse_auto_active) {
+        loader_reverse_auto_elapsed_ms = 0U;
+        return 0U;
+    }
+
+    loader_reverse_auto_elapsed_ms = DWT_GetTimeline_ms() - loader_reverse_auto_start_ms;
+    return (loader_reverse_auto_elapsed_ms >= LOADER_REVERSE_AUTO_EXIT_TIME_MS) ? 1U : 0U;
+}
+
+static float LoaderGetReverseDirection(float reference_speed_deg_s)
+{
+    float direction_speed = reference_speed_deg_s;
+
+    if (direction_speed > -LOADER_REF_EPS && direction_speed < LOADER_REF_EPS) {
+        direction_speed = loader->measure.speed_aps;
+    }
+
+    return (direction_speed < 0.0f) ? 1.0f : -1.0f;
+}
+
+static void LoaderStartStallReverse(float reference_speed_deg_s)
+{
+    float reverse_angle_motor_deg = LoaderAbsFloat(loader_reverse_angle_output_deg) * LOADER_MD_GEAR_RATIO;
+
+    loader_stall_state = LOADER_STALL_STATE_REVERSE;
+    loader_stall_over_current_count = 0U;
+    loader_stall_reverse_direction = LoaderGetReverseDirection(reference_speed_deg_s);
+    loader_stall_reverse_start_angle_deg = loader->measure.total_angle;
+    loader_reverse_angle_motor_deg = reverse_angle_motor_deg;
+    loader_reverse_target_angle_deg =
+        loader_stall_reverse_start_angle_deg + loader_stall_reverse_direction * reverse_angle_motor_deg;
+    loader_stall_reverse_error_deg = loader_reverse_target_angle_deg - loader->measure.total_angle;
+    LoaderResetSpeedPi();
+}
+
+static uint8_t LoaderIsStallReverseDone(void)
+{
+    float current_angle_deg = loader->measure.total_angle;
+    float tolerance_motor_deg = LOADER_STALL_REVERSE_TOL_OUTPUT_DEG * LOADER_MD_GEAR_RATIO;
+    float crossed_deg = loader_stall_reverse_direction * (current_angle_deg - loader_reverse_target_angle_deg);
+
+    loader_stall_reverse_error_deg = loader_reverse_target_angle_deg - current_angle_deg;
+
+    if (LoaderAbsFloat(loader_stall_reverse_error_deg) <= tolerance_motor_deg) {
+        return 1U;
+    }
+    if (crossed_deg >= 0.0f) {
+        return 1U;
+    }
+    return 0U;
+}
+
+static uint8_t LoaderUpdateStallProtection(float reference_speed_deg_s)
+{
+    float filtered_current = LoaderFilterStallCurrent(loader->measure.real_current);
+    uint8_t over_current =
+        (LoaderAbsFloat(filtered_current) > LOADER_STALL_CURRENT_THRESHOLD_RAW) ? 1U : 0U;
+
+    if (loader_stall_state == LOADER_STALL_STATE_REVERSE) {
+        if (LoaderIsStallReverseDone()) {
+            loader_stall_state = LOADER_STALL_STATE_NORMAL;
+            loader_stall_over_current_count = 0U;
+            LoaderResetSpeedPi();
+            return 0U;
+        }
+        return 1U;
+    }
+
+    if (over_current) {
+        if (loader_stall_over_current_count < LOADER_STALL_CONFIRM_COUNT) {
+            loader_stall_over_current_count++;
+        }
+    } else {
+        loader_stall_over_current_count = 0U;
+    }
+
+    if (loader_stall_over_current_count >= LOADER_STALL_CONFIRM_COUNT) {
+        LoaderStartStallReverse(reference_speed_deg_s);
+        return 1U;
+    }
+
+    return 0U;
+}
+
 /* 云台板发射任务：摩擦轮、激光与本地热量反馈 */
 void ShootTask_Gimbal(void)
 {
@@ -541,6 +777,7 @@ void ShootTask_Gimbal(void)
 
     // shoot_cmd 由 robot_cmd 统一生成；云台板这里只消费摩擦轮、激光和热量相关字段。
     SubGetMessage(shoot_sub, &shoot_cmd_recv);
+    ShootUpdateSpeedTargetByInitialSpeed(shoot_cmd_recv.bullet_speed);
 
     /*
      * shoot_mode 是发射总开关。
@@ -630,7 +867,7 @@ void ShootTask_Gimbal(void)
     shoot_speed  = fric_speed;
     last_load_mode = shoot_cmd_recv.load_mode;
 
-    // 本地热量和热量保护阈值回传给 robot_cmd/UI，供上层限制拨弹命令。
+    // 保持旧反馈接口字段稳定；本地发弹统计以 shoot_count 为准。
     memcpy(&shoot_feedback_data.shooter_local_heat, &local_heat, sizeof(float));
     memcpy(&shoot_feedback_data.shooter_heat_control, &heat_control, sizeof(int));
     PubPushMessage(shoot_pub, (void *)&shoot_feedback_data);
@@ -641,6 +878,12 @@ void ShootTask_Chassis(void)
 {
     // 从 CMD 任务接收云台板转发下来的发射控制指令。
     SubGetMessage(shoot_sub, &shoot_cmd_recv);
+    LoaderUpdateSpeedPiWatch();
+
+    uint8_t loader_stall_force_reverse = 0U;
+    loader_mode_e loader_cmd_load_mode = shoot_cmd_recv.load_mode;
+    float loader_speed_ref = 0.0f;
+    loader_feedforward = 0.0f;
 
     // shoot_mode 是总开关：关闭时直接停拨弹盘，开启时允许拨弹盘闭环工作。
     if (shoot_cmd_recv.shoot_mode == SHOOT_OFF) {
@@ -650,11 +893,65 @@ void ShootTask_Chassis(void)
     }
 
     /*
-     * 连发射频由 shoot_rate 给出，单位 Hz。
+     * 连发射频固定为 20Hz，不再从 Chassis_Ctrl_Cmd_s_uart / shoot_rate 接收。
      * cool_down_time 是角度式连发旧逻辑的节拍间隔；当前速度式连发仍保留它，方便回退调试。
      */
-    loader_burst_rate_hz = (shoot_cmd_recv.shoot_rate > 0.0f) ? shoot_cmd_recv.shoot_rate : 20.0f;
+    loader_burst_rate_hz = LOADER_MD_FIXED_BURST_RATE_HZ;
     cool_down_time = 1000.0f / loader_burst_rate_hz;
+
+    /*
+     * 卡弹检测前置：
+     * 只在发射开启、摩擦轮开启、拨弹命令为单发/连发时检测。
+     * 一旦进入反退状态，本地强制改成 LOAD_REVERSE，500 ms 后回到进入前的模式；
+     * 上层 LOAD_STOP 或 SHOOT_OFF 优先清掉卡弹状态。
+     */
+    if (shoot_cmd_recv.shoot_mode == SHOOT_OFF || shoot_cmd_recv.load_mode == LOAD_STOP) {
+        LoaderStopTimedReverse();
+        loader_reverse_auto_suppress = 0U;
+        LoaderResetStallProtection();
+    } else {
+        if (loader_reverse_auto_suppress && loader_cmd_load_mode != LOAD_REVERSE) {
+            loader_reverse_auto_suppress = 0U;
+        }
+
+        if (loader_reverse_auto_active) {
+            uint8_t loader_reverse_original_done = 0U;
+
+            if (loader_stall_state == LOADER_STALL_STATE_REVERSE &&
+                !LoaderUpdateStallProtection(loader->motor_controller.speed_PID.Ref)) {
+                loader_reverse_original_done = 1U;
+            }
+
+            if (loader_reverse_original_done || LoaderTimedReverseExpired()) {
+                LoaderStopTimedReverse();
+                if (loader_stall_state == LOADER_STALL_STATE_REVERSE) {
+                    LoaderResetStallProtection();
+                }
+                if (loader_cmd_load_mode == LOAD_REVERSE) {
+                    loader_reverse_auto_suppress = 1U;
+                }
+                shoot_cmd_recv.load_mode = loader_reverse_restore_mode;
+            } else {
+                if (loader_stall_state == LOADER_STALL_STATE_REVERSE) {
+                    loader_stall_force_reverse = 1U;
+                }
+                shoot_cmd_recv.load_mode = LOAD_REVERSE;
+            }
+        } else if (loader_reverse_auto_suppress && loader_cmd_load_mode == LOAD_REVERSE) {
+            shoot_cmd_recv.load_mode = loader_reverse_restore_mode;
+        } else if (loader_cmd_load_mode == LOAD_REVERSE) {
+            LoaderStartTimedReverse(last_load_mode);
+        } else if (shoot_cmd_recv.shoot_mode == SHOOT_ON &&
+                   shoot_cmd_recv.friction_mode == FRICTION_ON &&
+                   (loader_cmd_load_mode == LOAD_1_BULLET ||
+                    loader_cmd_load_mode == LOAD_BURSTFIRE)) {
+            if (LoaderUpdateStallProtection(loader->motor_controller.speed_PID.Ref)) {
+                LoaderStartTimedReverse(loader_cmd_load_mode);
+                loader_stall_force_reverse = 1U;
+                shoot_cmd_recv.load_mode = LOAD_REVERSE;
+            }
+        }
+    }
 
     switch (shoot_cmd_recv.load_mode) {
         case LOAD_STOP:
@@ -665,6 +962,7 @@ void ShootTask_Chassis(void)
             loader_burst_speed_mode_active = 0U;
             loader_burst_speed_ref_deg_s = 0.0f;
             loader_reverse_target_angle_deg = loader->measure.total_angle;
+            LoaderResetStallProtection();
             DJIMotorOuterLoop(loader, ANGLE_LOOP);
             DJIMotorSetRef(loader, loader->measure.total_angle);
             // 同步上板发来的发弹计数，并清除单发状态，防止再次进入单发时重复加一发。
@@ -687,6 +985,7 @@ void ShootTask_Chassis(void)
             dead_time      = 150;
             // 摩擦轮未开启时禁止拨弹，只把拨盘锁在当前位置。
             if (shoot_cmd_recv.friction_mode == FRICTION_OFF) {
+                LoaderResetStallProtection();
                 DJIMotorSetRef(loader, loader->measure.total_angle);
                 break;
             }
@@ -700,6 +999,7 @@ void ShootTask_Chassis(void)
             }
             // 按发弹计数换算拨盘目标角。
             DJIMotorSetRef(loader, load_count * LOADER_ANGLE_PER_BULLET + loader_initial_offset + loader_offset + loader_pitch_offset);
+            loader_speed_ref = loader->motor_controller.speed_PID.Ref;
             break;
 
         case LOAD_BURSTFIRE: {
@@ -713,6 +1013,7 @@ void ShootTask_Chassis(void)
                 loader_burst_speed_mode_active = 0U;
                 loader_burst_speed_ref_deg_s = 0.0f;
                 loader_reverse_target_angle_deg = loader->measure.total_angle;
+                LoaderResetStallProtection();
                 DJIMotorOuterLoop(loader, ANGLE_LOOP);
                 DJIMotorSetRef(loader, loader->measure.total_angle);
                 break;
@@ -728,8 +1029,7 @@ void ShootTask_Chassis(void)
             // }
             /*
              * 速度式连发：
-             * shoot_rate 先按 MD 拨盘经验系数换算为 rpm，再限幅并换算成电机侧 deg/s，
-             * 这样目标单位和 DJI 电机 speed_aps 反馈一致。
+             * 固定 20Hz -> 5400rpm -> 32400deg/s，目标单位和 DJI 电机 speed_aps 反馈一致。
              */
             loader_target_rpm = loader_burst_rate_hz * LOADER_MD_RPM_PER_HZ;
             if (loader_target_rpm > LOADER_MD_SPEED_LIMIT_RPM) {
@@ -739,8 +1039,10 @@ void ShootTask_Chassis(void)
             }
             loader_burst_speed_ref_deg_s = loader_target_rpm * LOADER_MD_DEG_S_PER_RPM;
             loader_burst_speed_mode_active = 1U;
+            loader_feedforward = LOADER_BURST_CURRENT_FEEDFORWARD_RAW;
             DJIMotorOuterLoop(loader, SPEED_LOOP);
             DJIMotorSetRef(loader, loader_burst_speed_ref_deg_s);
+            loader_speed_ref = loader_burst_speed_ref_deg_s;
             break;
         }
 
@@ -748,49 +1050,45 @@ void ShootTask_Chassis(void)
             /*
              * 退弹/防卡反转：
              * 刚进入 LOAD_REVERSE 时锁存一次反转目标，后续保持该目标，避免每拍都继续往后累加。
-             */
+            */
             loader_burst_speed_mode_active = 0U;
             loader_burst_speed_ref_deg_s = 0.0f;
-            loader_reverse_angle_motor_deg = loader_reverse_angle_output_deg * LOADER_MD_GEAR_RATIO;
-            if (last_load_mode != LOAD_REVERSE) {
-                loader_reverse_target_angle_deg = loader->measure.total_angle - loader_reverse_angle_motor_deg;
+            if (!loader_stall_force_reverse) {
+                loader_reverse_angle_motor_deg = loader_reverse_angle_output_deg * LOADER_MD_GEAR_RATIO;
+                LoaderResetStallProtection();
+                if (last_load_mode != LOAD_REVERSE) {
+                    loader_reverse_target_angle_deg = loader->measure.total_angle - loader_reverse_angle_motor_deg;
+                }
             }
             DJIMotorOuterLoop(loader, ANGLE_LOOP);
             // 退弹：默认反转 5 deg 输出轴，按 P36 齿比换算为 180 deg 电机侧角度。
             DJIMotorSetRef(loader, loader_reverse_target_angle_deg);
+            loader_speed_ref = loader->motor_controller.speed_PID.Ref;
             break;
 
         default:
             // 未知 load_mode 不改目标；保留断点位置，方便暴露通信或枚举异常。
             //while (1);
+            LoaderResetStallProtection();
     }
 
     // 记录本周期模式，供下一周期判断是否刚从 LOAD_STOP 进入单发。
     last_load_mode = shoot_cmd_recv.load_mode;
 
     /*
-     * 拨盘停止门和 ESO 更新：
+     * 拨盘停止门：
      * speed_PID.Ref 是内速度环参考，角度环模式下来自外角度 PI 输出，速度环模式下就是连发速度目标。
-     * 当 |Ref| 很小时强制纯 P、清积分并清 ESO 输出，避免静止锁角时补偿电流顶住拨盘；
-     * 有实际速度需求时再恢复 loader_speed_ki 并运行 ESO。
+     * 当前按调试要求关闭 loader ESO 补偿，也不再动态改 speed_PID.Ki。
+     * 目标速度接近 0 时只清积分和 ESO 残余输出，Ki 参数本身保持 Ozone/初始化值。
      */
-    float loader_speed_ref = loader->motor_controller.speed_PID.Ref;
     if (loader_speed_ref > -LOADER_REF_EPS && loader_speed_ref < LOADER_REF_EPS) {
-        loader->motor_controller.speed_PID.Ki    = 0.0f;
         loader->motor_controller.speed_PID.ITerm = 0.0f;
         loader->motor_controller.speed_PID.Iout  = 0.0f;
-        loader_eso.z2        = 0.0f;
-        loader_eso.i_eso_out = 0.0f;
-    } else {
-        loader->motor_controller.speed_PID.Ki = loader_speed_ki;
-        FrictionEso_Update(&loader_eso, loader, SHOOT_TASK_DT_S);
-        /* Reach-gate: once loader has hit 80% of its commanded speed (from angle-cascade
-         * or direct burst-fire setpoint) drop the comp; observer keeps running. */
-        FrictionEso_GateByReach(&loader_eso, loader->measure.speed_aps, loader_speed_ref);
     }
-    loader_feedforward = loader_eso.i_eso_out;
+    loader_eso.z2        = 0.0f;
+    loader_eso.i_eso_out = 0.0f;
 
-    // 发布发射反馈给 CMD/UI 使用；当前主要包含本地热量和热量保护阈值。
+    // 保持旧反馈接口字段稳定；本地发弹统计以 shoot_count 为准。
     memcpy(&shoot_feedback_data.shooter_local_heat, &local_heat, sizeof(float));
     memcpy(&shoot_feedback_data.shooter_heat_control, &heat_control, sizeof(int));
     PubPushMessage(shoot_pub, (void *)&shoot_feedback_data);
@@ -806,20 +1104,13 @@ void ShootTask_Chassis(void)
  */
 void Shoot_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
+    #ifdef GIMBAL_BOARD
     if(htim->Instance == TIM6)//再次确保是tim6
     {
-        /*-------------------------------------------热量控制部分---------------------------------------------*/
-        local_heat -= (shoot_cmd_recv.shooter_heat_cooling_rate / 1000.0f); // 1000Hz冷却
-        if (local_heat < 0) {
-            local_heat = 0;
-        }
-        if (shoot_cmd_recv.shooter_referee_heat - shoot_cmd_recv.shooter_cooling_limit >= 15) // 裁判系统判断已经超了热量
-        {
-            local_heat = shoot_cmd_recv.shooter_referee_heat;
-        }
-        Shoot_Fric_data_process();
+        ShootBulletCountProcess();
     }
     else {
         //系统运行出现了某种未知的错误,因为这个回调函数正常情况下只会被tim6触发,其他定时器不应该调用这个函数,如果调用了说明代码中可能存在指针越界或者内存溢出等问题导致htim指向了错误的定时器
     }
+    #endif
 }

@@ -5,8 +5,8 @@ The default fast profile is tuned for the current yaw LQRESO path:
   J * theta_ddot + B * theta_dot + Fc * sign(theta_dot) = tau
 
 It supports both older simple CSVs and current Ozone exports of
-g_yaw_lqr_ident_record, then compares multiple torque sources before choosing
-the median high-speed fit.
+g_yaw_lqr_ident_record / g_yaw_auto_aim_debug_record, then compares multiple
+torque sources before choosing the median high-speed fit.
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ ALIASES = {
     ),
     "valid": ("valid",),
     "feedback_ok": ("feedback_ok",),
+    "auto_aim_mode": ("auto_aim_mode",),
     "theta": (
         "theta_meas_rad",
         "yaw_angle_rad",
@@ -103,6 +104,28 @@ TORQUE_SOURCE_ORDER = (
     "motor_tor_nm",
 )
 
+HALF_RAW_IDENT_FIELDS = {
+    "theta_ref_cmd_deg",
+    "theta_ref_rad",
+    "omega_ref_rad_s",
+    "alpha_ref_rad_s2",
+    "theta_meas_rad",
+    "omega_meas_rad_s",
+    "e_theta_rad",
+    "e_omega_rad_s",
+    "tau_lqr_nm",
+    "tau_bias_nm",
+    "tau_cmd_nm",
+    "tau_meas_nm",
+    "tau_meas_filt_nm",
+    "tau_track_err_nm",
+    "motor_pos_rad",
+    "motor_total_pos_rad",
+    "motor_vel_rad_s",
+    "motor_tor_nm",
+    "ctrl_tor_set_nm",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -129,6 +152,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--angle-unit", choices=("rad", "deg"), default="rad")
     parser.add_argument("--gyro-unit", choices=("rad", "deg"), default="rad")
+    parser.add_argument(
+        "--aim-mode",
+        choices=("normal", "auto", "any"),
+        default="auto",
+        help="Filter auto_aim_mode when the CSV contains that column",
+    )
     parser.add_argument("--min-abs-torque", type=float, default=None)
     parser.add_argument("--min-abs-omega", type=float, default=None)
     parser.add_argument("--natural-freq", type=float, default=None, help="Closed-loop wn override, rad/s")
@@ -147,16 +176,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional lqr_eso.c path to update with the selected defaults",
     )
+    parser.add_argument(
+        "--ident-half-raw",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Decode g_yaw_lqr_ident_record uint16 binary16 fields exported from Ozone",
+    )
     return parser.parse_args()
 
 
 def normalize_name(name: str) -> str:
     text = name.strip()
-    prefix = "(g_yaw_lqr_ident_record)."
-    if text.startswith(prefix):
-        text = text[len(prefix):]
-    if text.startswith("g_yaw_lqr_ident_record."):
-        text = text.split(".", 1)[1]
+    for record_name in ("g_yaw_lqr_ident_record", "g_yaw_auto_aim_debug_record"):
+        prefix = f"({record_name})."
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+        prefix = f"{record_name}."
+        if text.startswith(prefix):
+            text = text[len(prefix):]
     text = text.replace("->", "_").replace(".", "_")
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
@@ -182,6 +219,55 @@ def parse_float(value: str | None) -> float:
     if not text:
         return math.nan
     return float(text)
+
+
+def half_raw_to_float(bits: int) -> float:
+    sign = -1.0 if (bits & 0x8000) else 1.0
+    exponent = (bits >> 10) & 0x1f
+    mantissa = bits & 0x03ff
+
+    if exponent == 0:
+        if mantissa == 0:
+            return math.copysign(0.0, sign)
+        return sign * math.ldexp(mantissa / 1024.0, -14)
+    if exponent == 0x1f:
+        return math.nan if mantissa else math.copysign(math.inf, sign)
+    return sign * math.ldexp(1.0 + mantissa / 1024.0, exponent - 15)
+
+
+def parse_half_raw(value: str | None) -> float:
+    if value is None:
+        return math.nan
+    text = value.strip()
+    if not text:
+        return math.nan
+    try:
+        raw = int(text, 0)
+    except ValueError:
+        return parse_float(text)
+    if raw < 0 or raw > 0xffff:
+        return parse_float(text)
+    return half_raw_to_float(raw)
+
+
+def should_decode_half_raw(column: str, mode: str) -> bool:
+    if mode == "off":
+        return False
+    normalized = normalize_name(column)
+    if normalized not in HALF_RAW_IDENT_FIELDS:
+        return False
+    if mode == "on":
+        return True
+    return "g_yaw_lqr_ident_record" in column
+
+
+def parse_column_value(row: dict[str, str], column: str | None, half_columns: set[str]) -> float:
+    if column is None:
+        return math.nan
+    value = row.get(column)
+    if column in half_columns:
+        return parse_half_raw(value)
+    return parse_float(value)
 
 
 def moving_average(values: Sequence[float], window: int) -> list[float]:
@@ -299,10 +385,17 @@ def load_samples(csv_path: Path, args: argparse.Namespace) -> tuple[list[dict[st
         omega_col = pick_column(columns, "omega")
         valid_col = pick_column(columns, "valid", required=False)
         feedback_col = pick_column(columns, "feedback_ok", required=False)
+        auto_aim_col = pick_column(columns, "auto_aim_mode", required=False)
         torque_cols = {
             key: column
             for key in TORQUE_SOURCE_ORDER
             if (column := pick_column(columns, key, required=False)) is not None
+        }
+        value_columns = [time_col, theta_col, omega_col, *torque_cols.values()]
+        half_columns = {
+            column
+            for column in value_columns
+            if should_decode_half_raw(column, args.ident_half_raw)
         }
 
         samples: list[dict[str, float]] = []
@@ -313,14 +406,20 @@ def load_samples(csv_path: Path, args: argparse.Namespace) -> tuple[list[dict[st
                 continue
             if feedback_col is not None and feedback_ok != 1.0:
                 continue
+            if auto_aim_col is not None and args.aim_mode != "any":
+                auto_aim_mode = parse_float(row.get(auto_aim_col))
+                if args.aim_mode == "auto" and auto_aim_mode != 1.0:
+                    continue
+                if args.aim_mode == "normal" and auto_aim_mode != 0.0:
+                    continue
 
             sample = {
-                "time": parse_float(row.get(time_col)),
-                "theta": parse_float(row.get(theta_col)),
-                "omega": parse_float(row.get(omega_col)),
+                "time": parse_column_value(row, time_col, half_columns),
+                "theta": parse_column_value(row, theta_col, half_columns),
+                "omega": parse_column_value(row, omega_col, half_columns),
             }
             for key, column in torque_cols.items():
-                sample[key] = parse_float(row.get(column))
+                sample[key] = parse_column_value(row, column, half_columns)
             if all(math.isfinite(sample[key]) for key in ("time", "theta", "omega")):
                 samples.append(sample)
 

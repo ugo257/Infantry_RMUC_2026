@@ -19,6 +19,24 @@
 #include "dji_motor.h"
 #include "super_cap.h"
 
+/*
+ * PDF 交互协议中图形名固定为 3 字节。
+ * 这里沿用工程历史的倒序写入方式，确保同名 ADD/CHANGE/DEL 的索引一致；
+ * 传入更长字符串时只取前 3 个字符，短字符串剩余字节补 0。
+ */
+static void UISetGraphName(uint8_t graphic_name[3], const char *graphname)
+{
+    memset(graphic_name, 0, 3U);
+
+    if (graphname == NULL) {
+        return;
+    }
+
+    for (uint8_t i = 0U; i < 3U && graphname[i] != '\0'; i++) {
+        graphic_name[2U - i] = (uint8_t)graphname[i];
+    }
+}
+
 /********************************************删除操作*************************************
 **参数：_id 对应的id结构体
         Del_Operate  对应头文件删除操作
@@ -64,11 +82,7 @@ void UIDelete(referee_id_t *_id, uint8_t Del_Operate, uint8_t Del_Layer)
 void UILineDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                 uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y, uint32_t End_x, uint32_t End_y)
 {
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) // 填充至‘0’为止
-    {
-        graph->graphic_name[2 - i] = graphname[i]; // 按内存地址增大方向填充，所以会有i与2-i
-    }
+    UISetGraphName(graph->graphic_name, graphname);
 
     graph->operate_tpye = Graph_Operate;
     graph->graphic_tpye = UI_Graph_Line;
@@ -98,10 +112,7 @@ void UILineDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, 
 void UIRectangleDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                      uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y, uint32_t End_x, uint32_t End_y)
 {
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) {
-        graph->graphic_name[2 - i] = graphname[i];
-    }
+    UISetGraphName(graph->graphic_name, graphname);
 
     graph->graphic_tpye = UI_Graph_Rectangle;
     graph->operate_tpye = Graph_Operate;
@@ -132,10 +143,7 @@ void UIRectangleDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Oper
 void UICircleDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                   uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y, uint32_t Graph_Radius)
 {
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) {
-        graph->graphic_name[2 - i] = graphname[i];
-    }
+    UISetGraphName(graph->graphic_name, graphname);
 
     graph->graphic_tpye = UI_Graph_Circle;
     graph->operate_tpye = Graph_Operate;
@@ -164,10 +172,7 @@ void UICircleDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate
 void UIOvalDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                 uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y, uint32_t end_x, uint32_t end_y)
 {
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) {
-        graph->graphic_name[2 - i] = graphname[i];
-    }
+    UISetGraphName(graph->graphic_name, graphname);
 
     graph->graphic_tpye = UI_Graph_Ellipse;
     graph->operate_tpye = Graph_Operate;
@@ -201,10 +206,7 @@ void UIArcDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, u
                uint32_t Graph_StartAngle, uint32_t Graph_EndAngle, uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y,
                uint32_t end_x, uint32_t end_y)
 {
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) {
-        graph->graphic_name[2 - i] = graphname[i];
-    }
+    UISetGraphName(graph->graphic_name, graphname);
 
     graph->graphic_tpye = UI_Graph_Arc;
     graph->operate_tpye = Graph_Operate;
@@ -239,11 +241,8 @@ void UIArcDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, u
 void UIFloatDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                  uint32_t Graph_Size, uint32_t Graph_Digit, uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y, int32_t Graph_Float)
 {
+    UISetGraphName(graph->graphic_name, graphname);
 
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) {
-        graph->graphic_name[2 - i] = graphname[i];
-    }
     graph->graphic_tpye = UI_Graph_Float;
     graph->operate_tpye = Graph_Operate;
     graph->layer        = Graph_Layer;
@@ -276,10 +275,8 @@ void UIFloatDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate,
 void UIIntDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                uint32_t Graph_Size, uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y, int32_t Graph_Integer)
 {
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) {
-        graph->graphic_name[2 - i] = graphname[i];
-    }
+    UISetGraphName(graph->graphic_name, graphname);
+
     graph->graphic_tpye = UI_Graph_Int;
     graph->operate_tpye = Graph_Operate;
     graph->layer        = Graph_Layer;
@@ -312,10 +309,7 @@ void UIIntDraw(Graph_Data_t *graph, char graphname[3], uint32_t Graph_Operate, u
 void UICharDraw(String_Data_t *graph, char graphname[3], uint32_t Graph_Operate, uint32_t Graph_Layer, uint32_t Graph_Color,
                 uint32_t Graph_Size, uint32_t Graph_Width, uint32_t Start_x, uint32_t Start_y,const char *fmt, ...)
 {
-    int i;
-    for (i = 0; i < 3 && graphname[i] != '\0'; i++) {
-        graph->Graph_Control.graphic_name[2 - i] = graphname[i];
-    }
+    UISetGraphName(graph->Graph_Control.graphic_name, graphname);
 
     graph->Graph_Control.graphic_tpye = UI_Graph_Char;
     graph->Graph_Control.operate_tpye = Graph_Operate;
@@ -330,74 +324,44 @@ void UICharDraw(String_Data_t *graph, char graphname[3], uint32_t Graph_Operate,
     graph->Graph_Control.end_x       = 0;
     graph->Graph_Control.end_y       = 0;
 
-    // va_list ap;
-    // va_start(ap, fmt);
-    // vsprintf((char *)graph->show_Data, fmt, ap); // 使用参数列表进行格式化并输出到字符串
-    // va_end(ap);
+    if (fmt != NULL) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf((char *)graph->show_Data, sizeof(graph->show_Data), fmt, ap);
+        va_end(ap);
+    }
     graph->Graph_Control.end_angle = strlen((const char *)graph->show_Data);
 }
-uint8_t uiSend[64];
 /* UI推送函数（使更改生效）
    参数： cnt   图形个数
             ...   图形变量参数
-   Tips：：该函数只能推送1，2，5，7个图形，其他数目协议未涉及
+   Tips：该函数只能推送1，2，5，7个图形，分别对应0x0101/0x0102/0x0103/0x0104
  */
-// void UIGraphRefresh(referee_id_t *_id, int cnt, ...)
-// {
-//     UI_GraphReFresh_t UI_GraphReFresh_data;
-//     Graph_Data_t graphData;
-
-//     uint8_t temp_datalength = LEN_HEADER + LEN_CMDID + Interactive_Data_LEN_Head + UI_Operate_LEN_PerDraw * cnt + LEN_TAIL; // 计算交互数据长度
-
-//     static uint8_t buffer[512]; // 交互数据缓存
-
-//     va_list ap;        // 创建一个 va_list 类型变量
-//     va_start(ap, cnt); // 初始化 va_list 变量为一个参数列表
-
-//     UI_GraphReFresh_data.FrameHeader.SOF        = REFEREE_SOF;
-//     UI_GraphReFresh_data.FrameHeader.DataLength = Interactive_Data_LEN_Head + cnt * UI_Operate_LEN_PerDraw;
-//     UI_GraphReFresh_data.FrameHeader.Seq        = UI_Seq;
-//     UI_GraphReFresh_data.FrameHeader.CRC8       = Get_CRC8_Check_Sum((uint8_t *)&UI_GraphReFresh_data, LEN_CRC8, 0xFF);
-
-//     UI_GraphReFresh_data.CmdID = ID_student_interactive;
-
-//     switch (cnt) {
-//         case 1:
-//             UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw1;
-//             break;
-//         case 2:
-//             UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw2;
-//             break;
-//         case 5:
-//             UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw5;
-//             break;
-//         case 7:
-//             UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw7;
-//             break;
-//     }
-
-//     UI_GraphReFresh_data.datahead.receiver_ID =_id->Cilent_ID;
-//     UI_GraphReFresh_data.datahead.sender_ID   =_id->Robot_ID;
-//     memcpy(buffer, (uint8_t *)&UI_GraphReFresh_data, LEN_HEADER + LEN_CMDID + Interactive_Data_LEN_Head); // 将帧头、命令码、交互数据帧头三部分复制到缓存中
-//     for (uint8_t i = 0; i < cnt; i++) // 发送交互数据的数据帧，并计算CRC16校验值
-//     {
-//         graphData = va_arg(ap, Graph_Data_t); // 访问参数列表中的每个项,第二个参数是你要返回的参数的类型,在取值时需要将其强制转化为指定类型的变量
-//         memcpy(buffer + (LEN_HEADER + LEN_CMDID + Interactive_Data_LEN_Head + UI_Operate_LEN_PerDraw * i), (uint8_t *)&graphData, UI_Operate_LEN_PerDraw);
-//     }
-//     Append_CRC16_Check_Sum(buffer, temp_datalength);
-//     memcpy(uiSend, buffer, temp_datalength);
-//     RefereeSend(buffer, temp_datalength);
-
-//     va_end(ap); // 结束可变参数的获取
-// }
-
-//步兵的ui
 void UIGraphRefresh(referee_id_t *_id, int cnt, ...)
 {
     UI_GraphReFresh_t UI_GraphReFresh_data;
     Graph_Data_t graphData;
+    uint16_t data_cmd_id;
 
-    uint8_t temp_datalength = LEN_HEADER + LEN_CMDID + Interactive_Data_LEN_Head + UI_Operate_LEN_PerDraw * cnt + LEN_TAIL; // 计算交互数据长度
+    switch (cnt) {
+        case 1:
+            data_cmd_id = UI_Data_ID_Draw1;
+            break;
+        case 2:
+            data_cmd_id = UI_Data_ID_Draw2;
+            break;
+        case 5:
+            data_cmd_id = UI_Data_ID_Draw5;
+            break;
+        case 7:
+            data_cmd_id = UI_Data_ID_Draw7;
+            break;
+        default:
+            return; // PDF只定义了1/2/5/7个图形的批量绘制子内容ID
+    }
+
+    uint16_t data_len = Interactive_Data_LEN_Head + UI_Operate_LEN_PerDraw * (uint16_t)cnt;
+    uint16_t tx_len = LEN_HEADER + LEN_CMDID + data_len + LEN_TAIL;
 
     static uint8_t buffer[512]; // 交互数据缓存
 
@@ -405,26 +369,12 @@ void UIGraphRefresh(referee_id_t *_id, int cnt, ...)
     va_start(ap, cnt); // 初始化 va_list 变量为一个参数列表
 
     UI_GraphReFresh_data.FrameHeader.SOF        = REFEREE_SOF;
-    UI_GraphReFresh_data.FrameHeader.DataLength = Interactive_Data_LEN_Head + cnt * UI_Operate_LEN_PerDraw;
+    UI_GraphReFresh_data.FrameHeader.DataLength = data_len;
     UI_GraphReFresh_data.FrameHeader.Seq        = UI_Seq;
     UI_GraphReFresh_data.FrameHeader.CRC8       = Get_CRC8_Check_Sum((uint8_t *)&UI_GraphReFresh_data, LEN_CRC8, 0xFF);
 
     UI_GraphReFresh_data.CmdID = ID_student_interactive;
-
-    switch (cnt) {
-        case 1:
-            UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw1;
-            break;
-        case 2:
-            UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw2;
-            break;
-        case 5:
-            UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw5;
-            break;
-        case 7:
-            UI_GraphReFresh_data.datahead.data_cmd_id = UI_Data_ID_Draw7;
-            break;
-    }
+    UI_GraphReFresh_data.datahead.data_cmd_id = data_cmd_id;
 
     UI_GraphReFresh_data.datahead.receiver_ID = _id->Cilent_ID;
     UI_GraphReFresh_data.datahead.sender_ID   = _id->Robot_ID;
@@ -435,10 +385,11 @@ void UIGraphRefresh(referee_id_t *_id, int cnt, ...)
         graphData = va_arg(ap, Graph_Data_t); // 访问参数列表中的每个项,第二个参数是你要返回的参数的类型,在取值时需要将其强制转化为指定类型的变量
         memcpy(buffer + (LEN_HEADER + LEN_CMDID + Interactive_Data_LEN_Head + UI_Operate_LEN_PerDraw * i), (uint8_t *)&graphData, UI_Operate_LEN_PerDraw);
     }
-    Append_CRC16_Check_Sum(buffer, temp_datalength);
-    RefereeSend(buffer, temp_datalength);
+    Append_CRC16_Check_Sum(buffer, tx_len);
+    RefereeSend(buffer, tx_len);
 
     va_end(ap); // 结束可变参数的获取
+    UI_Seq++;
 }
 /************************************************UI推送字符（使更改生效）*********************************/
 void UICharRefresh(referee_id_t *_id, String_Data_t string_Data)

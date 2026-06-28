@@ -26,9 +26,10 @@
 #include "motor_task.h"
 #include "omni_UI.h"
 #include "tick_timer.h"
+#include "yaw_jbc.h"
 //rtos任务最大延迟时间，超过设定的时间重启
 #define RTOS_TASK_CHECK_ENABLE    1
-#define RTOS_WDG_TIMEOUT_1MS_TASK_S 0.0012f
+#define RTOS_WDG_TIMEOUT_1MS_TASK_S 0.002f
 #define RTOS_WDG_TIMEOUT_UI_TASK_S  0.030f
 
 static inline void RTOSTaskCheckLog(const char *task_name, float dt_ms)
@@ -99,7 +100,7 @@ __attribute__((noreturn)) void _ChassisTask(void *argument)
         osDelay(1);
     }
 }
-float Gimbal_dt, Shoot_dt, motorControl_dt, Daemon_dt;
+float Gimbal_dt, Shoot_dt, motorControl_dt, Daemon_dt,cal_dt;
 __attribute__((noreturn)) void _GimbalTask(void *argument)
 {
     static DWTWatchdog_t gimbal_wdg;
@@ -108,10 +109,12 @@ __attribute__((noreturn)) void _GimbalTask(void *argument)
     for (;;) {
 #if defined(GIMBAL_BOARD)
         GimbalTask_PITCH();
+        // GimbalTask();
 #elif defined(CHASSIS_BOARD)
         GimbalTask_YAW();
-        Gimbal_dt = 1000.0f * DWTWatchdogGetLastDt(&gimbal_wdg);
+        
 #endif
+        Gimbal_dt = 1000.0f * DWTWatchdogGetLastDt(&gimbal_wdg);
         if (!DWTWatchdogUpdate(&gimbal_wdg)) {
             
             RTOSTaskCheckLog("Gimbal", Gimbal_dt);
@@ -160,7 +163,7 @@ __attribute__((noreturn)) void _UITask(void *argument)
 
     for (;;) {
 #ifdef CHASSIS_BOARD
-        //UIDynamicRefresh();
+        UIDynamicRefresh();
         ui_dt = 1000.0f * DWTWatchdogGetLastDt(&ui_wdg);
 #endif
         
@@ -182,6 +185,20 @@ __attribute__((noreturn)) void _DaemonTask(void *argument)
         if (!DWTWatchdogUpdate(&daemon_wdg)) {
             
             RTOSTaskCheckLog("Daemon", Daemon_dt);
+        }
+        osDelay(1);
+    }
+}
+__attribute__((noreturn)) void _CalTask(void *argument)
+{
+    static DWTWatchdog_t cal_wdg;
+    DWTWatchdogInit(&cal_wdg, RTOS_WDG_TIMEOUT_1MS_TASK_S);
+
+    for (;;) {
+        Cal_JBCTask();
+        cal_dt = 1000.0f * DWTWatchdogGetLastDt(&cal_wdg);
+        if (!DWTWatchdogUpdate(&cal_wdg)) {
+            RTOSTaskCheckLog("Cal_JBC", cal_dt);
         }
         osDelay(1);
     }

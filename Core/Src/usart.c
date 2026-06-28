@@ -21,7 +21,7 @@
 #include "usart.h"
 
 /* USER CODE BEGIN 0 */
-
+#include "robot_board.h"
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart1;
@@ -96,7 +96,9 @@ void MX_USART6_UART_Init(void)
 {
 
   /* USER CODE BEGIN USART6_Init 0 */
-
+  #ifdef CHASSIS_BOARD
+  huart6.Init.BaudRate = 115200;//裁判系统是115200
+  #endif 
   /* USER CODE END USART6_Init 0 */
 
   /* USER CODE BEGIN USART6_Init 1 */
@@ -115,7 +117,11 @@ void MX_USART6_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART6_Init 2 */
-
+  #ifdef CHASSIS_BOARD
+  huart6.Init.BaudRate = 115200;//裁判系统是115200
+  HAL_UART_DeInit(&huart6);
+  HAL_UART_Init(&huart6);
+  #endif 
   /* USER CODE END USART6_Init 2 */
 
 }

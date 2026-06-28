@@ -141,10 +141,15 @@ void DMMotorLostCallback(void *motor_ptr)
 {
     DMMotorInstance *motor = (DMMotorInstance *)motor_ptr;
     motor->online          = 0;
+    motor->ctrl.pos_set = 0.0f;
+    motor->ctrl.vel_set = 0.0f;
+    motor->ctrl.tor_set = 0.0f;
+    motor->ctrl.kp_set  = 0.0f;
+    motor->ctrl.kd_set  = 0.0f;
+    // DMMotorControl(motor); // 立即下发清零控制量，停止电机动作
     // 掉线后持续发送使能帧，等待电机重新进入可控状态。
     DMMotorEnableMode(motor);
-    for (size_t i = 0; i < 1000; i++)
-        CANTransmit(motor->motor_can_instance, 2);
+    CANTransmit(motor->motor_can_instance, 2);
 
     //LOGWARNING("[DMMotor] motor lost, id: %d", (motor->motor_can_instance->tx_id & (0x1f<<5)) >> 5);
 }
@@ -172,11 +177,7 @@ DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
     motor->online             = 0;
 
     DMMotorEnableMode(motor); // 使能电机模式,发送使能指令
-    CANTransmit(motor->motor_can_instance, 1);
-    // for (size_t i = 0; i < 100; i++) {
-
-    //     CANTransmit(motor->motor_can_instance, 2);
-    // }
+    CANTransmit(motor->motor_can_instance, 2);
     motor->ctrl.vel_set = 0;
     motor->ctrl.tor_set = 0; //   默认关闭，避免出问题
 
@@ -185,7 +186,7 @@ DMMotorInstance *DMMotorInit(Motor_Init_Config_s *config)
     Daemon_Init_Config_s daemon_config = {
         .callback     = DMMotorLostCallback,
         .owner_id     = motor,
-        .reload_count = 2, // 2ms
+        .reload_count = 4, // 4ms
     };
     motor->daemon = DaemonRegister(&daemon_config);
     motor->stop_flag = MOTOR_STOP;
@@ -232,27 +233,32 @@ void DMMotorSetRef(DMMotorInstance *motor, float ref)
  *          ctrl.pos_set/ctrl.vel_set；本函数只处理在线检测、停机清零、
  *          报文组包和 CAN 发送。
  */
+uint16_t cnt[2] ;
 void DMMotorControl()
 {
     DMMotorInstance *motor;
-
     for (size_t i = 0; i < idm; ++i) {
         motor = dmmotor_instance[i];
-
+        cnt[i]= (cnt[i] + 1) % 500; // 每500次控制周期发送一次失能帧（如果处于失能状态）
+        if(cnt[i] == 0){
+            DMMotorEnableMode(motor);
+            CANTransmit(motor->motor_can_instance, 2);
+            continue;
+        }
         /*
          * protocol_disable 是真正的 DM 协议失能状态，需要持续发送 FF..FD。
          * 这里放在自动重使能之前，避免失能期间被离线/非 state=1 分支重新拉起。
          */
-        if (motor->protocol_disable != 0u) {
-            DMMotorDisableMode(motor);
-            CANTransmit(motor->motor_can_instance, 1);
-            continue;
-        }
+        // if (motor->protocol_disable != 0u) {
+        //     DMMotorDisableMode(motor);
+        //     CANTransmit(motor->motor_can_instance, 2);
+        //     continue;
+        // }
 
         // 电机未进入正常控制状态前不要下发闭环输出，优先尝试重新使能。
         if (!motor->online || motor->measure.state != 1) {
             DMMotorEnableMode(motor);
-            CANTransmit(motor->motor_can_instance, 1);
+            CANTransmit(motor->motor_can_instance, 2);
             continue;
         }
 
@@ -282,7 +288,7 @@ void DMMotorControl()
             mit_ctrl(motor);
             break;
         }
-        CANTransmit(motor->motor_can_instance, 1);
+        CANTransmit(motor->motor_can_instance, 2);
     }
 }
 

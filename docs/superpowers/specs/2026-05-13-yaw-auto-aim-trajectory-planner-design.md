@@ -22,7 +22,6 @@ PC 自瞄当前下发 `(yaw_ref_rad, yaw_ref_vel_rad_s, yaw_ref_acc_rad_s2)` 三
 
 1. **Ref 阶梯化** 让 `tau_ff = J·α + B·ω` 在两包之间的平段瞬时偏小（α 在平段=0），错过了"平滑前馈"的机会。LQR 反馈环要单独把这部分补回来，固有引入相位滞后。
 2. **α 未滤波**，所以现有调参选择压低对 α 前馈的依赖（间接拉高 K_auto_theta=110 弥补），跟踪带宽受限。
-3. **无 staleness 检测**：PC 掉线时 firmware 会用过期 ω、α 继续做前馈，云台可能跑飞。
 
 ## 4. 设计目标
 
@@ -30,7 +29,6 @@ PC 自瞄当前下发 `(yaw_ref_rad, yaw_ref_vel_rad_s, yaw_ref_acc_rad_s2)` 三
 |---|---|
 | 消除 ref 阶梯，输出连续 (θ, ω, α) | 看 `g_theta_ref_planned` 曲线，无 staircase |
 | 显著减少 3Hz 场景下的相位滞后 | 实测 `gimbal_yaw` vs `plan_yaw` 相位差 |
-| PC 掉线时 yaw 安全停在最后位置 | 强制断开 PC RS485，验证 yaw 不飞 |
 | 不引入 α 噪声放大力矩抖动 | 看 `yaw_motor.tor` 高频频谱，对比改前 |
 | 不动手动模式行为 | 手动模式回归测试 |
 
@@ -44,7 +42,6 @@ PC 自瞄当前下发 `(yaw_ref_rad, yaw_ref_vel_rad_s, yaw_ref_acc_rad_s2)` 三
 PC(θ, ω, α) → 检测是否新包
   ├─ 有变化：latch (θ, ω, α)，重置时间计数器，α 进单极 LPF
   └─ 无变化：按 dt 用匀加速运动学外推 (θ, ω)
-       └─ 时间超过 stale_timeout：ω、α 指数衰减到 0，θ 冻结
 → 经可选 lookahead 后写入 theta/omega/alpha_planned
 → 下游 LQR/ESO 不变
 ```
@@ -69,9 +66,7 @@ uint8_t traj_initialized;           /* 是否已完成初次锁存 */
 | 名 | 默认 | 说明 |
 |---|---|---|
 | `g_traj_planner_enable`  | 1U     | **回退开关**：1=新外推器（默认）；0=回退到 legacy 直接覆盖 |
-| `g_traj_alpha_lpf_rc_s`  | 0.010f | α 一阶 LPF 时间常数（按包间隔做） |
-| `g_traj_stale_timeout_s` | 0.050f | 无新包多少秒后进入 staleness |
-| `g_traj_decay_tau_s`     | 0.030f | staleness 期内 ω、α 指数衰减时间常数 |
+| `g_traj_alpha_lpf_rc_s`  | 0.0f | α 一阶 LPF 时间常数（按包间隔做，默认不额外滤波） |
 | `g_traj_lookahead_s`     | 0.0f   | 输出端 lookahead（默认关，供后续按曲线调） |
 | `g_traj_change_eps_rad`  | 1e-6f  | (θ/ω/α) 变化判定阈值 |
 
@@ -126,25 +121,11 @@ RefPlanner_UpdateAutoAimTrajectory(ctrl, θ_in, ω_in, α_in, dt):
   OUTPUT:
   τ = ctrl->traj_dt_since_latch
 
-  if (τ > stale_timeout):
-      // staleness：θ 冻在过期那一刻外推到的位置；
-      // ω、α 也从那一刻的外推值开始指数衰减（保证 τ=stale_timeout 时输出连续）
-      Δ = stale_timeout
-      θ_freeze    = ctrl->traj_latched_θ
-                    + ctrl->traj_latched_ω * Δ
-                    + 0.5 * ctrl->traj_α_filt * Δ²
-      ω_at_freeze = ctrl->traj_latched_ω + ctrl->traj_α_filt * Δ
-      α_at_freeze = ctrl->traj_α_filt
-      decay = expf(-(τ - stale_timeout) / decay_tau)
-      θ_out = θ_freeze
-      ω_out = ω_at_freeze * decay
-      α_out = α_at_freeze * decay
-  else:
-      θ_out = ctrl->traj_latched_θ
-              + ctrl->traj_latched_ω * τ
-              + 0.5 * ctrl->traj_α_filt * τ²
-      ω_out = ctrl->traj_latched_ω + ctrl->traj_α_filt * τ
-      α_out = ctrl->traj_α_filt
+  θ_out = ctrl->traj_latched_θ
+          + ctrl->traj_latched_ω * τ
+          + 0.5 * ctrl->traj_α_filt * τ²
+  ω_out = ctrl->traj_latched_ω + ctrl->traj_α_filt * τ
+  α_out = ctrl->traj_α_filt
 
   // 可选 lookahead（默认 L=0）
   L = g_traj_lookahead_s
@@ -217,7 +198,6 @@ if (input->ref_traj_valid != 0U) {
 ## 6. 单元逻辑边界
 
 - `traj_dt_since_latch` 最大单调累加；不做翻转保护（float 在分钟级仍精确）
-- `expf` 在 staleness 长时间无 PC 时可能下溢到 0 —— 即 ω、α 完全归零，符合期望
 - `β` 因子在 `Δt_pkt=0`（同一 tick 多次调用）时 β=0，等于不更新 α_filt；该情形物理上不会出现
 - 限幅与原 `RefPlanner_UpdateTrajectory` 完全一致（`g_ref_omega_limit_rad_s` 和 `REF_ALPHA_LIMIT_RAD_S2_DEFAULT=300 rad/s²`）
 
@@ -227,21 +207,21 @@ if (input->ref_traj_valid != 0U) {
 
 1. **静态目标**：自瞄锁定不动目标，看 `g_theta_ref_planned` 是否光滑（无台阶）
 2. **3Hz 目标振荡**：原曲线场景复测，比较 plan_yaw vs gimbal_yaw 相位差
-3. **PC 强制断开**：拔 RS485，看 `g_omega_ref_planned` 是否在 ~50ms 后开始衰减、~150ms 内归零
+3. **无新包窗口**：保持输入不变，看规划输出是否继续按最后锁存轨迹外推
 4. **手动↔自瞄切换**：来回切，看是否平滑无跳变
 5. **力矩噪声**：录一段 `yaw_motor.tor`，FFT 对比改前是否高频抖动有改善
 
 ## 8. 风险
 
-- α LPF 引入小相位滞后（10ms RC 对 3Hz 信号 ≈ 11° 相位滞后），但相比 ref 阶梯消除的收益小一个量级，净收益正
-- 若 PC 实际带宽远低于 200Hz（如 50Hz），外推 20ms 后误差累积可能可见 → 默认 stale_timeout=50ms 在这种边界场景可能 false-trigger 衰减；如发现该情况，调大 stale_timeout
+- 若调大 α LPF RC，会引入小相位滞后；默认 `0.0f` 不额外滤波
+- 若 PC 实际带宽远低于 200Hz（如 50Hz），外推 20ms 后误差累积可能可见，需要从 PC 侧更新率或 lookahead 上处理
 - `g_traj_change_eps_rad=1e-6` 偏紧，可能把浮点噪声当新包；但因为 latch 仅替换数据、不重启滤波，几乎无副作用
 
 ## 9. 实施清单
 
-1. `lqr_eso.h`：新增 `YawLQRESO_s` 字段、6 个 `extern volatile` 全局参数（含 `g_traj_planner_enable`）
+1. `lqr_eso.h`：新增 `YawLQRESO_s` 字段、4 个 `extern volatile` 全局参数（含 `g_traj_planner_enable`）
 2. `lqr_eso.c`：
-   - 6 个全局参数定义 + 默认值宏
+   - 4 个全局参数定义 + 默认值宏
    - `RefPlanner_UpdateAutoAimTrajectory` 实现
    - `YawLQRESO_Calc` 调用点改为按 `g_traj_planner_enable` 分支
    - `YawLQRESO_Reset` 清新字段

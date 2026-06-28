@@ -13,6 +13,8 @@ typedef struct
 
 void PowerControlupdate(uint16_t max_power_init, float reduction_ratio_init);
 
+void PowerControlFeedbackUpdate(float measured_power_w, uint8_t measured_power_valid);
+
 float PowerInputCalc(float motor_speed, float motor_current);
 
 float TotalPowerCalc(float input_power[]);

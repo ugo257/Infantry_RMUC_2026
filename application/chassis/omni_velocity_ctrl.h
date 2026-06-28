@@ -49,6 +49,15 @@ typedef struct
     uint8_t slip_force_enable;              /* 1 表示滑移概率参与轮力分配降权 */
     float slip_force_gain;                  /* 滑移轮力降权增益 */
     float slip_force_min_weight;            /* 滑移轮最低轮力分配权重 */
+    float power_vxy_floor_ratio;            /* 功率不足时纯 vxy 最快可达速度的最低保留比例 */
+    float power_budget_margin;              /* 前置功率分配使用的预算裕度，避免后置硬限幅频繁介入 */
+    float power_wheel_speed_limit;           /* rotate 搜索用轮端速度参考上限，单位 deg/s */
+    float power_feedback_deadband_w;        /* 真实功率反馈死区，单位 W */
+    float power_feedback_scale_min;         /* 真实功率超限时允许压低到的最小预算比例 */
+    float power_feedback_down_alpha;        /* 真实功率超限时预算比例下降滤波系数 */
+    float power_feedback_up_alpha;          /* 真实功率未超限或无效时预算比例恢复滤波系数 */
+    float power_feedback_lpf_tau_s;         /* supercap 真实功率低通时间常数，单位 s */
+    float power_feedback_local_min_ratio;   /* 本地估算功率超过该比例的功率限制时才允许真实功率下压预算 */
 } OmniVelocityCtrlConfig_s;
 
 typedef struct
@@ -58,13 +67,24 @@ typedef struct
     float wz_ref;                           /* 车体系逆时针角速度指令 */
     float wheel_speed[OMNI_WHEEL_NUM];      /* 四轮编码器速度反馈，轮序为 LF/RF/RB/LB */
     float wheel_current[OMNI_WHEEL_NUM];    /* 四轮电流反馈，当前第一版只用于后续扩展 */
+    float external_wrench_ff[OMNI_AXIS_NUM]; /* 外部合力/力矩前馈，[Fx, Fy_left, Tz]，单位 N/N/N*m */
     float body_omega_z;                     /* 底盘 IMU yaw gyro，单位 rad/s */
     uint8_t body_omega_z_valid;             /* 1 表示 body_omega_z 可用于 wz 闭环 */
     uint8_t current_offset_enable;          /* 1 表示启用静摩擦电流补偿 */
-    uint8_t reserved[2];
+    uint8_t measured_power_valid;           /* 1 表示 measured_power_w 为 supercap 真实功率 */
+    uint8_t speed_power_model_enable;       /* 1 表示用速度环预测电流和轮速参考估算功率 */
+    uint8_t rotate_power_priority_enable;   /* 1 表示 rotate 下按 vxy 保留比例优先把剩余预算给 wz */
+    uint8_t power_search_only_enable;       /* 1 表示只更新最大可达缓存，不改写 nu_ref */
     float current_limit;                    /* 本周期统一电流限幅，单位 cmd；<=0 时用 config 默认 */
     float current_rate_limit;               /* 本周期统一电流变化率限幅，单位 cmd/s；<=0 时不限制 */
-    float temp_power_limit_w;               /* 临时底盘功率限幅，单位 W；<=0 时关闭 */
+    float temp_power_limit_w;               /* 最大可达速度搜索预算，单位 W；<=0 时关闭 */
+    float rotate_wz_search_limit;           /* rotate 模式搜索 wz_max 的绝对上界，单位 cmd；<=0 时退回 wz_ref */
+    float measured_power_w;                 /* supercap 反馈的真实底盘功率，单位 W */
+    float wheel_to_motor_speed_ratio;        /* 轮端速度到电机轴速度的换算系数，用于速度环功率预测 */
+    float speed_power_kp[OMNI_WHEEL_NUM];    /* 四轮速度环 Kp，用于预测本周期速度 PID 电流 */
+    float speed_power_iout[OMNI_WHEEL_NUM];  /* 四轮速度环当前 Iout，用于预测本周期速度 PID 电流 */
+    float speed_power_deadband[OMNI_WHEEL_NUM]; /* 四轮速度环死区，单位为电机轴速度 */
+    float speed_power_output_limit[OMNI_WHEEL_NUM]; /* 四轮速度环输出限幅，单位 cmd */
     float dt;                               /* 本周期实际时间；小于等于 0 时使用配置默认周期 */
 } OmniVelocityCtrlInput_s;
 
@@ -73,6 +93,21 @@ typedef enum
     OMNI_LQI_WZ_FEEDBACK_ENCODER = 0,
     OMNI_LQI_WZ_FEEDBACK_IMU = 1,
 } OmniLqiWzFeedbackSource_e;
+
+typedef struct
+{
+    uint8_t reachable_vxy_valid;            /* 1 表示 vxy 最大可达缓存有效 */
+    uint8_t reachable_wz_valid;             /* 1 表示 wz 最大可达缓存有效 */
+    uint8_t reserved[2];
+    float reachable_vxy_max;                /* 当前方向纯平移最大可达速度幅值 */
+    float reachable_wz_max;                 /* 纯自旋最大可达 wz 幅值 */
+    float reachable_vxy_dir_x;              /* vxy 缓存方向，vx 单位方向 */
+    float reachable_vxy_dir_y;              /* vxy 缓存方向，vy_left 单位方向 */
+    float reachable_vxy_budget_w;           /* vxy 缓存对应的搜索预算 */
+    float reachable_wz_budget_w;            /* wz 缓存对应的搜索预算 */
+    float reachable_vxy_wheel_speed_limit;  /* vxy 缓存对应的轮速约束 */
+    float reachable_wz_wheel_speed_limit;   /* wz 缓存对应的轮速约束 */
+} OmniReachableCache_s;
 
 typedef struct
 {
@@ -94,6 +129,24 @@ typedef struct
     uint8_t current_limit_active;           /* 本周期是否触发电流幅值限幅 */
     uint8_t current_rate_limit_active;      /* 本周期是否触发电流变化率限幅 */
     uint8_t lqi_wz_feedback_source;         /* OmniLqiWzFeedbackSource_e */
+    uint8_t power_limit_active;             /* 1 表示本周期触发 rotate 参考分配；最终硬限幅在 DJI 输出层 */
+    uint8_t power_real_valid;               /* 1 表示本周期接入 supercap 真实功率反馈 */
+    uint8_t reachable_vxy_valid;            /* 1 表示 reachable_vxy_max 可用于 rotate 分配 */
+    uint8_t reachable_wz_valid;             /* 1 表示 reachable_wz_max 可用于 rotate 分配 */
+    uint8_t rotate_strategy_active;         /* 1 表示本周期实际使用缓存最大可达速度做 rotate 分配 */
+    uint8_t reachable_vxy_search_success;   /* 1 表示本周期实时搜索更新了 vxy_max */
+    uint8_t reachable_wz_search_success;    /* 1 表示本周期实时搜索更新了 wz_max */
+    float power_vxy_scale;                  /* rotate 搜索后的 vx/vy 参考缩放 */
+    float power_wz_scale;                   /* rotate 搜索后的 wz 参考缩放 */
+    float power_est_full_w;                 /* 未做功率缩放时的估算正机械功率，单位 W */
+    float power_est_limited_w;              /* 功率缩放/硬限幅后的估算正机械功率，单位 W */
+    float power_real_w;                     /* supercap 真实底盘功率，单位 W */
+    float power_feedback_scale;             /* 真实功率反馈修正后的预算比例 */
+    float power_effective_limit_w;          /* 实际用于本周期功率分配/限幅的功率预算，单位 W */
+    float reachable_vxy_max;                /* 当前缓存方向的纯平移最大可达速度幅值 */
+    float reachable_wz_max;                 /* 当前 rotate 纯自旋最大可达 wz 幅值 */
+    float reachable_vxy_dir_x;              /* reachable_vxy_max 对应的 vx 单位方向 */
+    float reachable_vxy_dir_y;              /* reachable_vxy_max 对应的 vy_left 单位方向 */
 } OmniVelocityCtrlOutput_s;
 
 typedef struct
@@ -118,6 +171,30 @@ typedef struct
     float wrench_des_prev[OMNI_AXIS_NUM];
     float wrench_act_prev[OMNI_AXIS_NUM];
     float slip_prob[OMNI_WHEEL_NUM];
+    float power_vxy_scale;
+    float power_wz_scale;
+    float power_est_full_w;
+    float power_est_limited_w;
+    float power_real_w;
+    float power_real_lpf_w;
+    float power_feedback_scale;
+    float power_effective_limit_w;
+    float reachable_vxy_max;
+    float reachable_wz_max;
+    float reachable_vxy_dir_x;
+    float reachable_vxy_dir_y;
+    float reachable_vxy_budget_w;
+    float reachable_wz_budget_w;
+    float reachable_vxy_wheel_speed_limit;
+    float reachable_wz_wheel_speed_limit;
+    uint8_t power_limit_active;
+    uint8_t power_real_valid;
+    uint8_t power_real_lpf_valid;
+    uint8_t reachable_vxy_valid;
+    uint8_t reachable_wz_valid;
+    uint8_t rotate_strategy_active;
+    uint8_t reachable_vxy_search_success;
+    uint8_t reachable_wz_search_success;
     uint8_t lqi_wz_feedback_source;
     uint8_t inited;
 } OmniVelocityCtrl_s;
@@ -125,6 +202,11 @@ typedef struct
 void OmniVelocityCtrl_GetDefaultConfig(OmniVelocityCtrlConfig_s *config);
 void OmniVelocityCtrl_Init(OmniVelocityCtrl_s *ctrl, const OmniVelocityCtrlConfig_s *config);
 void OmniVelocityCtrl_Reset(OmniVelocityCtrl_s *ctrl);
+void OmniVelocityCtrl_ClearReachableCache(OmniVelocityCtrl_s *ctrl);
+void OmniVelocityCtrl_ExportReachableCache(const OmniVelocityCtrl_s *ctrl,
+                                           OmniReachableCache_s *cache);
+void OmniVelocityCtrl_ImportReachableCache(OmniVelocityCtrl_s *ctrl,
+                                           const OmniReachableCache_s *cache);
 void OmniVelocityCtrl_Step(OmniVelocityCtrl_s *ctrl,
                            const OmniVelocityCtrlInput_s *input,
                            OmniVelocityCtrlOutput_s *output);

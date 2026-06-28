@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 yaw 自瞄模式下，把 PC 下发的离散 (θ, ω, α) 升级为 1kHz 连续匀加速外推 + α 一阶 LPF + staleness 安全衰减，缓解 3Hz 跟踪场景下的相位滞后；保留 `g_traj_planner_enable` 运行时回退开关。
+**Goal:** 在 yaw 自瞄模式下，把 PC 下发的离散 (θ, ω, α) 升级为 1kHz 连续匀加速外推 + α 一阶 LPF，缓解 3Hz 跟踪场景下的相位滞后；保留 `g_traj_planner_enable` 运行时回退开关。
 
 **Architecture:** 在 `modules/lqr_eso/` 内部修改：扩展 `YawLQRESO_s` 状态、新增可调全局参数、新增 `RefPlanner_UpdateAutoAimTrajectory` 函数、在 `YawLQRESO_Calc` 内按 `g_traj_planner_enable` 分支调用新/旧规划器。`gimbal.c`、`robot_cmd.c`、PC 协议、下游 LQR/ESO 全部不动。
 
@@ -114,16 +114,16 @@ git commit -m "lqr_eso: add yaw auto-aim trajectory extrapolation state fields"
 
 ---
 
-## Task 2: 添加 6 个可调全局参数（extern + definition + 默认宏）
+## Task 2: 添加 4 个可调全局参数（extern + definition + 默认宏）
 
 **Files:**
 - Modify: `modules/lqr_eso/lqr_eso.h:174-235`（extern declarations 区）
 - Modify: `modules/lqr_eso/lqr_eso.c:21-77`（默认值宏区）
 - Modify: `modules/lqr_eso/lqr_eso.c:78-139`（global definitions 区）
 
-**说明：** 6 个参数都用 `volatile` 暴露给 SWD Live Watch，运行时可调。`g_traj_planner_enable` 是回退总开关。
+**说明：** 4 个参数都用 `volatile` 暴露给 SWD Live Watch，运行时可调。`g_traj_planner_enable` 是回退总开关。
 
-- [ ] **Step 1: 在 `lqr_eso.h` 的 extern 块尾部插入 6 个 extern 声明**
+- [ ] **Step 1: 在 `lqr_eso.h` 的 extern 块尾部插入 4 个 extern 声明**
 
 定位 `lqr_eso.h:235`（`extern volatile float g_pitch_eso_tau_comp;` 这一行），在它之后插入：
 
@@ -131,34 +131,28 @@ git commit -m "lqr_eso: add yaw auto-aim trajectory extrapolation state fields"
 /* Auto-aim trajectory planner tunables (live-watchable) */
 extern volatile uint8_t g_traj_planner_enable;
 extern volatile float g_traj_alpha_lpf_rc_s;
-extern volatile float g_traj_stale_timeout_s;
-extern volatile float g_traj_decay_tau_s;
 extern volatile float g_traj_lookahead_s;
 extern volatile float g_traj_change_eps_rad;
 ```
 
-- [ ] **Step 2: 在 `lqr_eso.c` 默认值宏区尾部插入 6 个默认值宏**
+- [ ] **Step 2: 在 `lqr_eso.c` 默认值宏区尾部插入 4 个默认值宏**
 
 定位 `lqr_eso.c:77`（`#define PITCH_STATE_MEASURE 7U` 这一行），在它之后插入：
 
 ```c
 #define TRAJ_PLANNER_ENABLE_DEFAULT         1U
-#define TRAJ_ALPHA_LPF_RC_DEFAULT           0.010f
-#define TRAJ_STALE_TIMEOUT_DEFAULT          0.050f
-#define TRAJ_DECAY_TAU_DEFAULT              0.030f
+#define TRAJ_ALPHA_LPF_RC_DEFAULT           0.0f
 #define TRAJ_LOOKAHEAD_DEFAULT              0.0f
 #define TRAJ_CHANGE_EPS_RAD_DEFAULT         1e-6f
 ```
 
-- [ ] **Step 3: 在 `lqr_eso.c` 全局变量定义区尾部插入 6 个变量定义**
+- [ ] **Step 3: 在 `lqr_eso.c` 全局变量定义区尾部插入 4 个变量定义**
 
 定位 `lqr_eso.c:139`（`volatile float g_pitch_eso_tau_comp = 0.0f;` 这一行），在它之后插入：
 
 ```c
 volatile uint8_t g_traj_planner_enable      = TRAJ_PLANNER_ENABLE_DEFAULT;
 volatile float g_traj_alpha_lpf_rc_s        = TRAJ_ALPHA_LPF_RC_DEFAULT;
-volatile float g_traj_stale_timeout_s       = TRAJ_STALE_TIMEOUT_DEFAULT;
-volatile float g_traj_decay_tau_s           = TRAJ_DECAY_TAU_DEFAULT;
 volatile float g_traj_lookahead_s           = TRAJ_LOOKAHEAD_DEFAULT;
 volatile float g_traj_change_eps_rad        = TRAJ_CHANGE_EPS_RAD_DEFAULT;
 ```
@@ -169,13 +163,13 @@ volatile float g_traj_change_eps_rad        = TRAJ_CHANGE_EPS_RAD_DEFAULT;
 cmake --build --preset Debug -j
 ```
 
-Expected: 编译成功，无未定义引用（因为 6 个变量都同时声明+定义了）。
+Expected: 编译成功，无未定义引用（因为 4 个变量都同时声明+定义了）。
 
 - [ ] **Step 5: Commit**
 
 ```sh
 git add modules/lqr_eso/lqr_eso.h modules/lqr_eso/lqr_eso.c
-git commit -m "lqr_eso: add auto-aim trajectory planner tunables (enable + LPF + staleness)"
+git commit -m "lqr_eso: add auto-aim trajectory planner tunables (enable + LPF)"
 ```
 
 ---
@@ -185,7 +179,7 @@ git commit -m "lqr_eso: add auto-aim trajectory planner tunables (enable + LPF +
 **Files:**
 - Modify: `modules/lqr_eso/lqr_eso.c`（在 `RefPlanner_UpdateTrajectory` 之后、`YawLQRESO_Init` 之前插入新函数）
 
-**说明：** 新函数包含运动学外推、变化检测、α LPF、staleness 衰减、可选 lookahead、限幅 6 个段落，全部按设计文档 §5.5 实现。**保留** 原有 `RefPlanner_UpdateTrajectory` 不删（回退路径会调用它）。
+**说明：** 新函数包含运动学外推、变化检测、α LPF、可选 lookahead、限幅 5 个段落，全部按设计文档 §5.5 实现。**保留** 原有 `RefPlanner_UpdateTrajectory` 不删（回退路径会调用它）。
 
 - [ ] **Step 1: 定位插入点**
 
@@ -203,8 +197,6 @@ static void RefPlanner_UpdateAutoAimTrajectory(YawLQRESO_s *ctrl,
     float omega_limit;
     float change_eps;
     float rc;
-    float stale_timeout;
-    float decay_tau;
     float lookahead_s;
     float theta_out;
     float omega_out;
@@ -217,8 +209,6 @@ static void RefPlanner_UpdateAutoAimTrajectory(YawLQRESO_s *ctrl,
 
     change_eps    = LQRESOAbs(g_traj_change_eps_rad);
     rc            = (g_traj_alpha_lpf_rc_s > 0.0f) ? g_traj_alpha_lpf_rc_s : 0.0f;
-    stale_timeout = (g_traj_stale_timeout_s > 0.0f) ? g_traj_stale_timeout_s : 0.0f;
-    decay_tau     = (g_traj_decay_tau_s > 0.0f) ? g_traj_decay_tau_s : 1e-3f;
     lookahead_s   = (g_traj_lookahead_s > 0.0f) ? g_traj_lookahead_s : 0.0f;
     omega_limit   = LQRESOAbs(g_ref_omega_limit_rad_s);
 
@@ -280,21 +270,9 @@ static void RefPlanner_UpdateAutoAimTrajectory(YawLQRESO_s *ctrl,
             const float a_f = ctrl->traj_alpha_filt_rad_s2;
             const float th_l = ctrl->traj_latched_theta_rad;
 
-            if (stale_timeout > 0.0f && tau > stale_timeout) {
-                /* (4a) Staleness: freeze theta at stale entry; decay omega/alpha. */
-                const float d = stale_timeout;
-                const float theta_freeze = th_l + w_l * d + 0.5f * a_f * d * d;
-                const float omega_at_freeze = w_l + a_f * d;
-                const float decay = expf(-(tau - stale_timeout) / decay_tau);
-                theta_out = theta_freeze;
-                omega_out = omega_at_freeze * decay;
-                alpha_out = a_f * decay;
-            } else {
-                /* (4b) Normal constant-acceleration extrapolation. */
-                theta_out = th_l + w_l * tau + 0.5f * a_f * tau * tau;
-                omega_out = w_l + a_f * tau;
-                alpha_out = a_f;
-            }
+            theta_out = th_l + w_l * tau + 0.5f * a_f * tau * tau;
+            omega_out = w_l + a_f * tau;
+            alpha_out = a_f;
         }
     }
 
@@ -337,7 +315,7 @@ Expected: 可能出现 "defined but not used"。若工具链严格则需要先�
 
 ```sh
 git add modules/lqr_eso/lqr_eso.c
-git commit -m "lqr_eso: implement RefPlanner_UpdateAutoAimTrajectory (extrapolation + alpha LPF + staleness)"
+git commit -m "lqr_eso: implement RefPlanner_UpdateAutoAimTrajectory (extrapolation + alpha LPF)"
 ```
 
 ---
@@ -523,14 +501,13 @@ Pass criteria: `g_theta_ref_planned` 在静止目标下变化幅度更小且无�
 
 Pass criteria: 改前 30-50ms 相位滞后；改后应显著缩小（目标 <20ms）。如未达预期，下一步用 lookahead 微调。
 
-- [ ] **Step 5: PC 强制掉线测试**
+- [ ] **Step 5: 无新包窗口行为确认**
 
-自瞄锁定中，**拔掉 RS485 线**或停止 NUC 发送。
+自瞄锁定中保持输入不变，观察规划器不进入额外保护分支。
 
 Pass criteria:
-- 约 50ms 后 `g_omega_ref_planned` 开始衰减
-- 150ms 内 `g_omega_ref_planned` 和 `g_alpha_ref_planned` 接近 0
-- yaw 不飞、不抖、`g_theta_ref_planned` 冻在最后位置
+- `g_theta_ref_planned / g_omega_ref_planned / g_alpha_ref_planned` 继续按最后锁存轨迹外推
+- 不出现额外归零行为
 
 - [ ] **Step 6: 回退开关验证**
 
@@ -550,7 +527,7 @@ Pass criteria: 切换瞬间 yaw 无跳变、无 fault；每次回到自瞄都重
 
 - [ ] **Step 9: 全部通过后归档测试报告**
 
-新建 `docs/yaw_traj_planner_test_2026-05-13.md` 记录每个 step 实测数据（相位差、衰减时间、有无回退异常）。
+新建 `docs/yaw_traj_planner_test_2026-05-13.md` 记录每个 step 实测数据（相位差、外推连续性、有无回退异常）。
 
 ```sh
 git add docs/yaw_traj_planner_test_2026-05-13.md
@@ -564,7 +541,7 @@ git commit -m "docs: yaw auto-aim trajectory planner on-device test report"
 1. 编译无新增警告/错误
 2. `g_traj_planner_enable=1` 时跟踪 3Hz 目标的相位滞后较改前显著减小
 3. `g_traj_planner_enable=0` 时行为与改前完全一致（回归保险）
-4. PC 掉线后 150ms 内 yaw 安全衰减
+4. 无新包窗口不触发额外保护，仍按锁存轨迹外推
 5. 手动↔自瞄切换无跳变
 6. 设备端测试报告完整
 
