@@ -1,0 +1,8 @@
+D:/Infantry/build_ninja/CMakeFiles/Infantry_RMUC_2026.dir
+D:/Infantry/build_ninja/CMakeFiles/edit_cache.dir
+D:/Infantry/build_ninja/CMakeFiles/rebuild_cache.dir
+D:/Infantry/build_ninja/cmake/stm32cubemx/CMakeFiles/STM32_Drivers.dir
+D:/Infantry/build_ninja/cmake/stm32cubemx/CMakeFiles/USB_Device_Library.dir
+D:/Infantry/build_ninja/cmake/stm32cubemx/CMakeFiles/FreeRTOS.dir
+D:/Infantry/build_ninja/cmake/stm32cubemx/CMakeFiles/edit_cache.dir
+D:/Infantry/build_ninja/cmake/stm32cubemx/CMakeFiles/rebuild_cache.dir

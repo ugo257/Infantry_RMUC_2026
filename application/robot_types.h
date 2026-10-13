@@ -25,6 +25,7 @@ typedef enum {
     CHASSIS_FOLLOW_GIMBAL_YAW,
     CHASSIS_REVERSE_ROTATE,
     CHASSIS_MECANUM_FORCE,
+    CHASSIS_DIRECT,
 } chassis_mode_e;
 
 typedef enum {

@@ -133,7 +133,6 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             usart_instance[i]->recv_len = recv_len;
             if (usart_instance[i]->module_callback != NULL) {
                 usart_instance[i]->module_callback();
-                memset(usart_instance[i]->recv_buff, 0, recv_len); // 接收结束后清空buffer,对于变长数据是必要的
             }
             HAL_UARTEx_ReceiveToIdle_DMA(usart_instance[i]->usart_handle, usart_instance[i]->recv_buff, usart_instance[i]->recv_buff_size);
             __HAL_DMA_DISABLE_IT(usart_instance[i]->usart_handle->hdmarx, DMA_IT_HT);//失能DMA半传输中断防止两次进入HAL_UARTEx_RxEventCallback()，这是HAL库的一个设计失误,发生DMA传输完成/半完成以及串口IDLE中断都会触发HAL_UARTEx_RxEventCallback()，我们只希望处理第一种和第三种情况，因此直接关闭DMA半传输中断

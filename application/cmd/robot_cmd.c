@@ -30,6 +30,14 @@
 #include "iwdg.h"
 // 图传协议中C档的值为0，因此丢控不能再靠开关字段是否为0判断。
 #define RC_LOST (!RemoteControlIsOnline())
+#define CHASSIS_DR16_VXY_SCALE 12.0f
+#define CHASSIS_DR16_STALE_TICKS 100u
+#define CHASSIS_DR16_YAW_STICK_FULL 660.0f
+#define CHASSIS_DR16_YAW_ANGLE_MAX_DEFAULT_DEG 35.0f
+#define CHASSIS_DR16_YAW_ANGLE_KP_DEFAULT 35.0f
+#define CHASSIS_DR16_YAW_WZ_MAX_DEFAULT 1200.0f
+#define CHASSIS_DR16_YAW_CMD_TO_RADPS 1.3e-3f
+#define CHASSIS_DR16_YAW_SETTLE_DEG 1.0f
 #define VISION_RX_PERIOD_MIN_S      0.0001f
 #define VISION_RX_PERIOD_MAX_S      0.1000f
 #define VISION_RX_PERIOD_AVG_ALPHA  0.20f
@@ -135,6 +143,17 @@ static uint8_t mecanum_force_ctrl_enable = 0u; // 麦轮力控独立开关（与
 static uint8_t remote_nuc_toggle_enable = 0u;
 static uint8_t remote_rotate_enable = 0u;
 static uint8_t mouse_key_z_count_last = 0u;
+
+#if defined(CHASSIS_DR16_DIRECT_CONTROL)
+volatile float chassis_dr16_yaw_angle_max_deg = CHASSIS_DR16_YAW_ANGLE_MAX_DEFAULT_DEG;
+volatile float chassis_dr16_yaw_angle_kp = CHASSIS_DR16_YAW_ANGLE_KP_DEFAULT;
+volatile float chassis_dr16_yaw_wz_max = CHASSIS_DR16_YAW_WZ_MAX_DEFAULT;
+volatile float chassis_dr16_yaw_angle_ref_watch = 0.0f;
+volatile float chassis_dr16_yaw_angle_est_watch = 0.0f;
+volatile float chassis_dr16_yaw_angle_error_watch = 0.0f;
+volatile float chassis_dr16_yaw_wz_cmd_watch = 0.0f;
+volatile uint8_t chassis_dr16_yaw_angle_active_watch = 0U;
+#endif
 
 static uint16_t RobotCMDGet17mmHeatStopHeat(uint16_t heat_limit)
 {
@@ -411,6 +430,9 @@ void RobotCMDInit()
                            robot_cmd_upload_signals,
                            ROBOT_CMD_UPLOAD_SIGNAL_COUNT);
     RS485SetRecvCallback(rs485_slaver_instance, RobotCMD485SlaveRecvCallback, NULL);
+#if defined(CHASSIS_DR16_DIRECT_CONTROL)
+    rc_data = RemoteControlInit(&huart3);
+#endif
     // 注册底盘控制的发布者和订阅者
     chassis_cmd_pub  = PubRegister("chassis_cmd", sizeof(Chassis_Ctrl_Cmd_s));
     chassis_feed_sub = SubRegister("chassis_feed", sizeof(Chassis_Upload_Data_s));
@@ -418,7 +440,12 @@ void RobotCMDInit()
 #endif
 
 #ifdef GIMBAL_BOARD
-    rc_data = RemoteControlInit(&huart6); // 修改为对应串口,注意如果是自研板dbus协议串口需选用添加了反相器的那个
+#if defined(RC_DR16)
+    // DR16/DBUS uses the board's inverted 100 kbit/s receiver on USART3.
+    rc_data = RemoteControlInit(&huart3);
+#elif defined(RC_VTM)
+    rc_data = RemoteControlInit(&huart6);
+#endif
 #if defined(VISION_USE_VCP)
     HostInstanceConf host_conf0 = {
         .comm_mode = HOST_VCP,
@@ -477,6 +504,24 @@ static float RobotCMDWrap180Deg(float angle_deg)
     }
     return angle_deg;
 }
+
+#if defined(CHASSIS_DR16_DIRECT_CONTROL)
+static float RobotCMDClampFloat(float value, float lower, float upper)
+{
+    if (value < lower) {
+        return lower;
+    }
+    if (value > upper) {
+        return upper;
+    }
+    return value;
+}
+
+static float RobotCMDFiniteOr(float value, float fallback)
+{
+    return (isfinite(value) != 0) ? value : fallback;
+}
+#endif
 
 /**
  * @brief 根据gimbal app传回的当前电机角度计算和零位的误差
@@ -796,6 +841,126 @@ static void EmergencyHandler()
     // LOGERROR("[CMD] emergency stop!");
     (void)0;
 }
+
+#if defined(CHASSIS_DR16_DIRECT_CONTROL)
+static float RobotCMDApplyChassisDR16YawAngleControl(int16_t yaw_stick)
+{
+    static uint8_t yaw_angle_active = 0u;
+    static uint32_t yaw_angle_dwt_cnt = 0u;
+    static uint8_t yaw_angle_dt_primed = 0u;
+    static float yaw_angle_est_deg = 0.0f;
+    static float yaw_last_wz_cmd = 0.0f;
+    float dt = DWT_GetDeltaT(&yaw_angle_dwt_cnt);
+
+    if (yaw_angle_dt_primed == 0u || isfinite(dt) == 0 ||
+        dt <= 0.0f || dt > 0.02f) {
+        dt = 0.001f;
+        yaw_angle_dt_primed = 1u;
+    }
+
+    yaw_angle_est_deg += yaw_last_wz_cmd *
+                         (CHASSIS_DR16_YAW_CMD_TO_RADPS * RAD_TO_ANGLE) *
+                         dt;
+
+    if (yaw_stick == 0) {
+        yaw_angle_active = 0u;
+        yaw_angle_est_deg = 0.0f;
+        yaw_last_wz_cmd = 0.0f;
+        chassis_dr16_yaw_angle_active_watch = 0U;
+        chassis_dr16_yaw_angle_ref_watch = 0.0f;
+        chassis_dr16_yaw_angle_est_watch = 0.0f;
+        chassis_dr16_yaw_angle_error_watch = 0.0f;
+        chassis_dr16_yaw_wz_cmd_watch = 0.0f;
+        return 0.0f;
+    }
+
+    if (yaw_angle_active == 0u) {
+        yaw_angle_est_deg = 0.0f;
+        yaw_last_wz_cmd = 0.0f;
+        yaw_angle_active = 1u;
+    }
+
+    const float stick_norm = RobotCMDClampFloat((float)yaw_stick /
+                                                CHASSIS_DR16_YAW_STICK_FULL,
+                                                -1.0f,
+                                                1.0f);
+    const float yaw_angle_max_deg =
+        fabsf(RobotCMDFiniteOr((float)chassis_dr16_yaw_angle_max_deg,
+                               CHASSIS_DR16_YAW_ANGLE_MAX_DEFAULT_DEG));
+    const float yaw_kp =
+        fabsf(RobotCMDFiniteOr((float)chassis_dr16_yaw_angle_kp,
+                               CHASSIS_DR16_YAW_ANGLE_KP_DEFAULT));
+    const float yaw_wz_max =
+        fabsf(RobotCMDFiniteOr((float)chassis_dr16_yaw_wz_max,
+                               CHASSIS_DR16_YAW_WZ_MAX_DEFAULT));
+    const float yaw_ref_deg = stick_norm * yaw_angle_max_deg;
+    const float yaw_est_limit = (yaw_angle_max_deg > 1.0f) ?
+        (yaw_angle_max_deg * 1.5f) :
+        1.5f;
+    yaw_angle_est_deg = RobotCMDClampFloat(yaw_angle_est_deg,
+                                           -yaw_est_limit,
+                                           yaw_est_limit);
+    const float yaw_error_deg = yaw_ref_deg - yaw_angle_est_deg;
+    float wz_cmd = 0.0f;
+    if (fabsf(yaw_error_deg) > CHASSIS_DR16_YAW_SETTLE_DEG) {
+        wz_cmd = RobotCMDClampFloat(yaw_error_deg * yaw_kp,
+                                    -yaw_wz_max,
+                                    yaw_wz_max);
+    }
+
+    chassis_dr16_yaw_angle_active_watch = 1U;
+    chassis_dr16_yaw_angle_ref_watch = yaw_ref_deg;
+    chassis_dr16_yaw_angle_est_watch = yaw_angle_est_deg;
+    chassis_dr16_yaw_angle_error_watch = yaw_error_deg;
+    chassis_dr16_yaw_wz_cmd_watch = wz_cmd;
+    yaw_last_wz_cmd = wz_cmd;
+    return wz_cmd;
+}
+
+static void RobotCMDApplyChassisDR16DirectControl(void)
+{
+    static uint32_t last_update_count = 0u;
+    static uint16_t stale_ticks = CHASSIS_DR16_STALE_TICKS;
+    const uint32_t update_count = RemoteControlGetUpdateCount();
+
+    if (update_count != last_update_count) {
+        last_update_count = update_count;
+        stale_ticks = 0u;
+    } else if (stale_ticks < CHASSIS_DR16_STALE_TICKS) {
+        stale_ticks++;
+    }
+
+    if (update_count == 0u || stale_ticks >= CHASSIS_DR16_STALE_TICKS ||
+        RC_LOST || !switch_is_n(rc_data[TEMP].rc.switch_mode)) {
+        chassis_cmd_send.vx = 0.0f;
+        chassis_cmd_send.vy = 0.0f;
+        chassis_cmd_send.wz = 0.0f;
+        (void)RobotCMDApplyChassisDR16YawAngleControl(0);
+        EmergencyHandler();
+        return;
+    }
+
+    // Keep the existing translation scaling; right horizontal stick commands a bounded yaw angle.
+    chassis_cmd_send.vx = CHASSIS_DR16_VXY_SCALE * (float)rc_data[TEMP].rc.rocker_l1;
+    chassis_cmd_send.vy = CHASSIS_DR16_VXY_SCALE * (float)rc_data[TEMP].rc.rocker_l_;
+    chassis_cmd_send.wz =
+        RobotCMDApplyChassisDR16YawAngleControl(rc_data[TEMP].rc.rocker_r_);
+
+    chassis_cmd_send.offset_angle = 0.0f;
+    chassis_cmd_send.gimbal_mode = GIMBAL_ZERO_FORCE;
+    chassis_cmd_send.chassis_mode = CHASSIS_DIRECT;
+    chassis_cmd_send.mecanum_force_enable = 0u;
+    chassis_cmd_send.SuperCap_flag_from_user = SUPERCAP_UNUSE;
+
+    // Allow four-wheel bring-up without referee data, matching RobotCMDInit defaults.
+    if (chassis_cmd_send.power_limit == 0u) {
+        chassis_cmd_send.power_limit = 100u;
+    }
+    if (chassis_cmd_send.supercap_power_limit == 0u) {
+        chassis_cmd_send.supercap_power_limit = 100u;
+    }
+}
+#endif
 
 static float PitchCmdClampFloat(float value, float lower, float upper)
 {
@@ -1674,13 +1839,17 @@ static void RobotCMDTaskChassisBoard(void)
     shoot_cmd_send.shoot_mode = chassis_rs485_recv.shoot_mode;
     shoot_cmd_send.shoot_count = chassis_rs485_recv.shoot_count;
     shoot_cmd_send.friction_mode = chassis_rs485_recv.friction_mode;
+#if !defined(CHASSIS_DR16_DIRECT_CONTROL)
     chassis_cmd_send.vx = chassis_rs485_recv.vx;
     chassis_cmd_send.vy = chassis_rs485_recv.vy;
     chassis_cmd_send.wz = chassis_rs485_recv.wz;
+#endif
     chassis_cmd_send.yaw_control = chassis_rs485_recv.yaw_control;
     chassis_cmd_send.nuc_enable_flag=remote_nuc_toggle_enable;
+#if !defined(CHASSIS_DR16_DIRECT_CONTROL)
     chassis_cmd_send.chassis_mode = chassis_rs485_recv.chassis_mode;
     chassis_cmd_send.gimbal_mode = chassis_rs485_recv.gimbal_mode;
+#endif
     chassis_cmd_send.hole_offset_yaw_takeover = hole_offset_yaw_takeover;
     //chassis_cmd_send.offset_angle = chassis_rs485_recv.offset_angle;
     //chassis_cmd_send.gimbal_error_angle = chassis_rs485_recv.gimbal_error_angle;
@@ -1695,6 +1864,9 @@ static void RobotCMDTaskChassisBoard(void)
     chassis_cmd_send.gimbal_yaw_signal_sound_angle =
         chassis_rs485_recv.gimbal_yaw_signal_sound_angle;
     chassis_cmd_send.mecanum_force_enable = (chassis_rs485_recv.UI_SendFlag & MECANUM_FORCE_UI_FLAG_BIT) ? 1u : 0u;
+#if defined(CHASSIS_DR16_DIRECT_CONTROL)
+    RobotCMDApplyChassisDR16DirectControl();
+#endif
 	/*--------------------------发射数据更新--------------------------------------------------------------------------------*/
     RobotCMDUpdateShootReferee(referee_data->GameRobotState.shooter_heat_cooling_per_s,
                                referee_data->PowerHeatData.shooter_17mm_heat,

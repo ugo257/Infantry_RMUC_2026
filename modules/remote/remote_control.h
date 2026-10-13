@@ -134,5 +134,6 @@ RC_ctrl_t *RemoteControlInit(UART_HandleTypeDef *rc_usart_handle);
  * @return uint8_t 1:在线 0:离线
  */
 uint8_t RemoteControlIsOnline();
+uint32_t RemoteControlGetUpdateCount(void);
 
 #endif

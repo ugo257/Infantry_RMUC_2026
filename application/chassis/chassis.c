@@ -169,12 +169,6 @@ static float chassis_vx_body_prev = 0.0f, chassis_vy_body_prev = 0.0f, chassis_w
 static float vt_lf, vt_rf, vt_lb, vt_rb;         // omni 控制器输出的轮端速度参考，发送给 DJI 前需要乘减速比
 static float kl=1;
 extern INS_Instance *INS;
-int8_t sign_lf, sign_rf, sign_lb, sign_rb;
-
-static float friction_lf_state = 0.0f;
-static float friction_rf_state = 0.0f;
-static float friction_lb_state = 0.0f;
-static float friction_rb_state = 0.0f;
 static float Power_Output;
 static float chassis_speed_current_ff_lf = 0.0f;
 static float chassis_speed_current_ff_rf = 0.0f;
@@ -494,78 +488,8 @@ void ChassisInit()
  */
 float vxy_max_accel = 150000.0f;
 float wz_max_accel = 500000.0f; // wz 命令斜率限制，cmd/s；1 cmd ≈ 1.3e-3 rad/s，故 100000 ≈ 130 rad/s²
-float friction_compensation_lf = 600.0f;
-float friction_compensation_rf = -750.0f;  
-float friction_compensation_lb = 110.0f;  
-float friction_compensation_rb = -100.0f;  
-
-// float friction_compensation_lf = 0.0f;  
-// float friction_compensation_rf = 0.0f;  
-// float friction_compensation_lb = 0.0f;  
-// float friction_compensation_rb = 0.0f;  
-
-// 死区与滞回参数
-#define FRICTION_KICK_THRESHOLD 100.0f    // 低速启动阈值（度/秒）
-#define FRICTION_HYSTERESIS 30.0f          // 滞回带宽度（度/秒）
-#define FRICTION_SMOOTHING 0.2f            // 补偿平滑系数（0~1）
-
-/**
- * @brief 标准摩擦补偿：定值随指令方向变号，带智能死区
- * @param velocity_cmd 速度指令（度/秒）
- * @param compensation 补偿定值
- * @param last_sign 上次方向状态指针（用于滞回）
- * @return 补偿力（与指令方向相反）
- */
-static float calculateFrictionCompensation(float velocity_cmd, float compensation, int8_t *last_sign)
-{
-    //无指令时：补偿归零，确保绝对静止
-    if (fabsf(velocity_cmd) < 1.0f) {
-        *last_sign = 0;
-        return 0.0f;
-    }
-    
-    int8_t current_sign;
-    
-    // 滞回判断：防止方向符号抖动
-    if (fabsf(velocity_cmd) > FRICTION_KICK_THRESHOLD + FRICTION_HYSTERESIS) {
-        current_sign = (velocity_cmd > 0.0f) ? 1 : -1;
-        *last_sign = current_sign;
-    } else if (fabsf(velocity_cmd) < FRICTION_KICK_THRESHOLD - FRICTION_HYSTERESIS) {
-        // 低速启动区：给kick启动力
-        if (*last_sign == 0) {
-            current_sign = (velocity_cmd > 0.0f) ? 1 : -1;
-            *last_sign = current_sign;
-        } else {
-            current_sign = *last_sign;  // 保持上次方向
-        }
-    } else {
-        // 滞回带内：保持上次状态，防止翻符号
-        current_sign = (*last_sign != 0) ? *last_sign : ((velocity_cmd > 0.0f) ? 1 : -1);
-        *last_sign = current_sign;
-    }
-    return -compensation * (float)current_sign;
-}
-
-/**
- * @brief 更新四个轮子的摩擦补偿
- * @param velocity_cmd_* 各轮速度指令（度/秒）
- */
-static void updateAllWheelsFriction(float velocity_cmd_lf, float velocity_cmd_rf, 
-                                     float velocity_cmd_lb, float velocity_cmd_rb)
-{
-    
-    float target_lf = calculateFrictionCompensation(velocity_cmd_lf, friction_compensation_lf, &sign_lf);
-    float target_rf = calculateFrictionCompensation(velocity_cmd_rf, friction_compensation_rf, &sign_rf);
-    float target_lb = calculateFrictionCompensation(velocity_cmd_lb, friction_compensation_lb, &sign_lb);
-    float target_rb = calculateFrictionCompensation(velocity_cmd_rb, friction_compensation_rb, &sign_rb);
-    // 平滑过渡到目标值
-    friction_lf_state += FRICTION_SMOOTHING * (target_lf - friction_lf_state);
-    friction_rf_state += FRICTION_SMOOTHING * (target_rf - friction_rf_state);
-    friction_lb_state += FRICTION_SMOOTHING * (target_lb - friction_lb_state);
-    friction_rb_state += FRICTION_SMOOTHING * (target_rb - friction_rb_state);
-    // 调试输出
-    
-}
+volatile float chassis_direct_speed_pid_maxout = 6400.0f;
+volatile uint8_t chassis_direct_rf_feedback_reverse = 0U;
 static inline float SlewRateLimit(float target, float prev, float max_step)
 {
     float delta = target - prev;
@@ -646,6 +570,13 @@ static uint8_t ChassisRotateVxyActive(float vx, float vy)
             fabsf(vy) > CHASSIS_ROTATE_VXY_ACTIVE_EPS) ? 1U : 0U;
 }
 
+static uint8_t ChassisDirectInputIdle(float vx, float vy_left, float wz)
+{
+    return (fabsf(vx) <= CHASSIS_ROTATE_VXY_ACTIVE_EPS &&
+            fabsf(vy_left) <= CHASSIS_ROTATE_VXY_ACTIVE_EPS &&
+            fabsf(wz) <= CHASSIS_ROTATE_VXY_ACTIVE_EPS) ? 1U : 0U;
+}
+
 static void ChassisReachableFlashSetDebug(uint16_t power_limit,
                                           uint8_t load_valid,
                                           uint8_t slot_index)
@@ -700,16 +631,6 @@ static void ChassisApplyBodyFrameSlewLimit(float dt)
     chassis_vx_body_prev = chassis_vx;
     chassis_vy_body_prev = chassis_vy;
     chassis_wz_body_prev = chassis_cmd_recv.wz;
-}
-
-static void MecanumCalculate()
-{
-    vt_lf = chassis_vx + chassis_vy + chassis_cmd_recv.wz * LF_CENTER;
-    vt_rf = -chassis_vx + chassis_vy + chassis_cmd_recv.wz * RF_CENTER;
-    vt_lb = chassis_vx - chassis_vy + chassis_cmd_recv.wz * LB_CENTER;
-    vt_rb = -chassis_vx - chassis_vy + chassis_cmd_recv.wz * RB_CENTER;
-
-    updateAllWheelsFriction(vt_lf, vt_rf, vt_lb, vt_rb);
 }
 
 static void ChassisClearSpeedCurrentFeedforward(void);
@@ -769,6 +690,25 @@ static void ChassisEnableWheelMotors(void)
     if (motor_rb != NULL) {
         DJIMotorEnable(motor_rb);
         motor_rb->motor_controller.speed_PID.MaxOut = 16384.0f;
+    }
+}
+
+static void ChassisSetWheelSpeedPidMaxOut(float max_out)
+{
+    max_out = ChassisClampFloat(ChassisAbsFiniteFloat(max_out, 3000.0f),
+                                0.0f,
+                                16384.0f);
+    if (motor_lf != NULL) {
+        motor_lf->motor_controller.speed_PID.MaxOut = max_out;
+    }
+    if (motor_rf != NULL) {
+        motor_rf->motor_controller.speed_PID.MaxOut = max_out;
+    }
+    if (motor_lb != NULL) {
+        motor_lb->motor_controller.speed_PID.MaxOut = max_out;
+    }
+    if (motor_rb != NULL) {
+        motor_rb->motor_controller.speed_PID.MaxOut = max_out;
     }
 }
 
@@ -1207,6 +1147,46 @@ static void ChassisClearGravityFeedforwardDebug(void)
     chassis_gravity_ff_roll_rad = 0.0f;
     chassis_gravity_ff_force_x_n = 0.0f;
     chassis_gravity_ff_force_y_right_n = 0.0f;
+}
+
+static void ChassisDirectApplyWheelFeedbackDirection(void);
+
+static void ChassisDirectIdleStop(void)
+{
+    chassis_cmd_recv.vx = 0.0f;
+    chassis_cmd_recv.vy = 0.0f;
+    chassis_cmd_recv.wz = 0.0f;
+    ChassisZeroWheelRef();
+    ChassisSetAllWheelRefZero();
+    ChassisSetWheelSpeedLoop(motor_lf);
+    ChassisSetWheelSpeedLoop(motor_rf);
+    ChassisSetWheelSpeedLoop(motor_rb);
+    ChassisSetWheelSpeedLoop(motor_lb);
+    ChassisDirectApplyWheelFeedbackDirection();
+    ChassisSetWheelSpeedPidMaxOut((float)chassis_direct_speed_pid_maxout);
+    ChassisClearSpeedCurrentFeedforward();
+    ChassisClearGravityFeedforwardDebug();
+    OmniVelocityCtrl_Reset(&omni_ctrl);
+    memset(&omni_output, 0, sizeof(omni_output));
+}
+
+static void ChassisDirectApplyWheelFeedbackDirection(void)
+{
+    if (motor_lf != NULL) {
+        motor_lf->motor_settings.feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL;
+    }
+    if (motor_rf != NULL) {
+        motor_rf->motor_settings.feedback_reverse_flag =
+            (chassis_direct_rf_feedback_reverse != 0U) ?
+            FEEDBACK_DIRECTION_REVERSE :
+            FEEDBACK_DIRECTION_NORMAL;
+    }
+    if (motor_rb != NULL) {
+        motor_rb->motor_settings.feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL;
+    }
+    if (motor_lb != NULL) {
+        motor_lb->motor_settings.feedback_reverse_flag = FEEDBACK_DIRECTION_NORMAL;
+    }
 }
 
 static float ChassisSpeedFeedforwardCurrentLimit(uint8_t wheel)
@@ -2074,6 +2054,45 @@ static uint8_t ChassisOmniHCalibApplyCommand(float cmd_vx,
     return 1U;
 }
 
+static void ChassisDirectApplyMecanumSpeed(float vx, float vy_right, float wz)
+{
+    float wheel_speed_fit[OMNI_WHEEL_NUM];
+
+    ChassisSetWheelSpeedLoop(motor_lf);
+    ChassisSetWheelSpeedLoop(motor_rf);
+    ChassisSetWheelSpeedLoop(motor_rb);
+    ChassisSetWheelSpeedLoop(motor_lb);
+    ChassisDirectApplyWheelFeedbackDirection();
+    ChassisSetWheelSpeedPidMaxOut((float)chassis_direct_speed_pid_maxout);
+    ChassisClearSpeedCurrentFeedforward();
+    ChassisClearGravityFeedforwardDebug();
+    memset(&omni_output, 0, sizeof(omni_output));
+
+    ChassisOmniHCalibBuildIdealWheelSpeed(vx, -vy_right, wz, wheel_speed_fit);
+    vt_lf = omni_ctrl.config.wheel_dir[OMNI_WHEEL_LF] * wheel_speed_fit[OMNI_WHEEL_LF];
+    vt_rf = omni_ctrl.config.wheel_dir[OMNI_WHEEL_RF] * wheel_speed_fit[OMNI_WHEEL_RF];
+    vt_rb = omni_ctrl.config.wheel_dir[OMNI_WHEEL_RB] * wheel_speed_fit[OMNI_WHEEL_RB];
+    vt_lb = omni_ctrl.config.wheel_dir[OMNI_WHEEL_LB] * wheel_speed_fit[OMNI_WHEEL_LB];
+
+    omni_output.wheel_speed_ref[OMNI_WHEEL_LF] = vt_lf;
+    omni_output.wheel_speed_ref[OMNI_WHEEL_RF] = vt_rf;
+    omni_output.wheel_speed_ref[OMNI_WHEEL_RB] = vt_rb;
+    omni_output.wheel_speed_ref[OMNI_WHEEL_LB] = vt_lb;
+
+    if (motor_lf != NULL) {
+        DJIMotorSetRef(motor_lf, ChassisWheelSpeedToMotorSpeed(vt_lf));
+    }
+    if (motor_rf != NULL) {
+        DJIMotorSetRef(motor_rf, ChassisWheelSpeedToMotorSpeed(vt_rf));
+    }
+    if (motor_rb != NULL) {
+        DJIMotorSetRef(motor_rb, ChassisWheelSpeedToMotorSpeed(vt_rb));
+    }
+    if (motor_lb != NULL) {
+        DJIMotorSetRef(motor_lb, ChassisWheelSpeedToMotorSpeed(vt_lb));
+    }
+}
+
 static void ChassisOmniHCalibAdvanceSegment(void)
 {
     if (chassis_h_calib_sign > 0) {
@@ -2643,6 +2662,10 @@ void ChassisTask()
             chassis_cmd_recv.wz = -5000;
             break;
 
+        case CHASSIS_DIRECT:
+            // Direct chassis control keeps the upstream body-frame wz command unchanged.
+            break;
+
         default:
             // 未识别模式不改写 wz，沿用 robot_cmd 下发值，便于调试新模式时观察原始命令。
             break;
@@ -2685,6 +2708,30 @@ void ChassisTask()
         chassis_vy = chassis_cmd_recv.vx * sin_theta + chassis_cmd_recv.vy * cos_theta;
     }
     ChassisApplyBodyFrameSlewLimit(ctrl_dt);
+
+    if (chassis_cmd_recv.chassis_mode == CHASSIS_DIRECT) {
+        /*
+         * DR16 bring-up path: bypass LQI/ESO/omni closed-loop control and
+         * write four DJI speed references directly after mecanum solving.
+         */
+        if (chassis_lqi_current_active != 0U) {
+            ChassisExitLqiCurrentMode();
+        }
+        if (ChassisDirectInputIdle(cmd_vx_pre_slew,
+                                   cmd_vy_pre_slew,
+                                   cmd_wz_pre_slew) != 0U) {
+            ChassisDirectIdleStop();
+            ChassisInvalidateOmniForceDebug(ctrl_dt);
+            ChassisUpdateOmniHCalibRecord();
+            ChassisPublishFeedback();
+            return;
+        }
+        ChassisDirectApplyMecanumSpeed(chassis_vx, chassis_vy, chassis_cmd_recv.wz);
+        ChassisInvalidateOmniForceDebug(ctrl_dt);
+        ChassisUpdateOmniHCalibRecord();
+        ChassisPublishFeedback();
+        return;
+    }
 
     /*
      * 进入 omni/LQI/ESO/轮力分配链路。

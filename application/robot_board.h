@@ -17,8 +17,8 @@
 #endif
 
 /* Remote controller selection: keep exactly one of the following enabled */
-// #define RC_DR16 //旧遥控器
-#define RC_VTM //新图传遥控器
+#define RC_DR16 //旧遥控器
+// #define RC_VTM //新图传遥控器
 
 /* Remote controller macro check */
 #if defined(RC_DR16) && defined(RC_VTM)
@@ -31,6 +31,9 @@
 
 /* Feature selection */
 #if defined(CHASSIS_BOARD)
+#if defined(RC_DR16)
+#define CHASSIS_DR16_DIRECT_CONTROL
+#endif
 #elif defined(GIMBAL_BOARD)
 #define VISION_USE_VCP
 // #define VISION_USE_UART

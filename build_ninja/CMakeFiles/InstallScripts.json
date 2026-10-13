@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/Infantry/build_ninja/cmake_install.cmake",
+		"D:/Infantry/build_ninja/cmake/stm32cubemx/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

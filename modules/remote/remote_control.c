@@ -12,8 +12,10 @@
 
 #if defined(RC_DR16)
 #define REMOTE_CONTROL_FRAME_SIZE 18u // DR16/DBUS遥控器接收的buffer大小
+#define REMOTE_CONTROL_DEADBAND   20
 #elif defined(RC_VTM)
 #define REMOTE_CONTROL_FRAME_SIZE 21u // VTM遥控器接收的buffer大小
+#define REMOTE_CONTROL_DEADBAND   3
 #define REMOTE_CONTROL_VTM_FRAME_HEAD1 0xA9u
 #define REMOTE_CONTROL_VTM_FRAME_HEAD2 0x53u
 #else
@@ -27,6 +29,8 @@
 // 遥控器数据
 RC_ctrl_t rc_ctrl[2];     //[0]:当前数据TEMP,[1]:上一次的数据LAST.用于按键持续按下和切换的判断
 static uint8_t rc_init_flag = 0; // 遥控器初始化标志位
+static volatile uint32_t rc_update_count = 0u;
+static volatile uint8_t rc_recovery_started = 0u;
 
 // 遥控器拥有的串口实例,因为遥控器是单例,所以这里只有一个,就不封装了
 static USARTInstance *rc_usart_instance;
@@ -65,7 +69,7 @@ static void RectifyRCjoystick()
     };
 
     for (uint8_t i = 0; i < 5; ++i)
-        if (abs(*joysticks[i]) > 660 || abs(*joysticks[i]) < 3)
+        if (abs(*joysticks[i]) > 660 || abs(*joysticks[i]) < REMOTE_CONTROL_DEADBAND)
             *joysticks[i] = 0;
 }
 
@@ -106,7 +110,9 @@ static void RemoteControlUpdateKeyState(void)
 static void RemoteControlFinishFrame(void)
 {
     RemoteControlUpdateKeyState();
+    rc_update_count++;
     rc_update_flag = 1;
+    rc_recovery_started = 0u;
     DaemonReload(rc_daemon_instance);
 }
 
@@ -137,8 +143,9 @@ static uint8_t RemoteControlParseDR16(const uint8_t *sbus_buf)
     uint16_t ch2 = (((uint16_t)sbus_buf[2] >> 6) | ((uint16_t)sbus_buf[3] << 2) |
                     ((uint16_t)sbus_buf[4] << 10)) & 0x07ffu;
     uint16_t ch3 = (((uint16_t)sbus_buf[4] >> 1) | ((uint16_t)sbus_buf[5] << 7)) & 0x07ffu;
-    uint8_t switch_left = (uint8_t)(((uint16_t)sbus_buf[5] >> 4) & 0x0003u);
-    uint8_t switch_right = (uint8_t)((((uint16_t)sbus_buf[5] >> 4) & 0x000cu) >> 2);
+    // 和参考工程保持一致：低两位是右开关，高两位是左开关。
+    uint8_t switch_right = (uint8_t)(((uint16_t)sbus_buf[5] >> 4) & 0x0003u);
+    uint8_t switch_left = (uint8_t)((((uint16_t)sbus_buf[5] >> 4) & 0x000cu) >> 2);
     uint16_t wheel = ((uint16_t)sbus_buf[16] | ((uint16_t)sbus_buf[17] << 8)) & 0x07ffu;
 
     if (!RemoteControlDR16ChannelIsValid(ch0) || !RemoteControlDR16ChannelIsValid(ch1) ||
@@ -149,11 +156,11 @@ static uint8_t RemoteControlParseDR16(const uint8_t *sbus_buf)
 
     memcpy(&rc_ctrl[LAST], &rc_ctrl[TEMP], sizeof(RC_ctrl_t)); // 保存上一次的数据,用于按键持续按下和切换的判断
 
-    // DR16/DBUS通道定义: ch0右水平, ch1右竖直, ch2左竖直, ch3左水平。
+    // DR16/DBUS通道定义: ch0右水平, ch1右竖直, ch2左水平, ch3左竖直。
     rc_ctrl[TEMP].rc.rocker_r_ = (int16_t)ch0 - RC_CH_VALUE_OFFSET;
     rc_ctrl[TEMP].rc.rocker_r1 = (int16_t)ch1 - RC_CH_VALUE_OFFSET;
-    rc_ctrl[TEMP].rc.rocker_l1 = (int16_t)ch2 - RC_CH_VALUE_OFFSET;
-    rc_ctrl[TEMP].rc.rocker_l_ = (int16_t)ch3 - RC_CH_VALUE_OFFSET;
+    rc_ctrl[TEMP].rc.rocker_l_ = (int16_t)ch2 - RC_CH_VALUE_OFFSET;
+    rc_ctrl[TEMP].rc.rocker_l1 = (int16_t)ch3 - RC_CH_VALUE_OFFSET;
     rc_ctrl[TEMP].rc.dial = (int16_t)wheel - RC_CH_VALUE_OFFSET;
 
     RectifyRCjoystick();
@@ -261,9 +268,21 @@ static void RemoteControlRxCallback()
  */
 static void RCLostCallback(void *id)
 {
-    memset(rc_ctrl, 0, sizeof(rc_ctrl)); // 清空遥控器数据
-    USARTServiceInit(rc_usart_instance); // 尝试重新启动接收
-    LOGWARNING("[rc] remote control lost");
+    (void)id;
+
+    /*
+     * Keep the last valid frame for state/debug visibility. All motion
+     * control paths gate their output with RemoteControlIsOnline(), so a
+     * lost link still produces an emergency stop. Restart the DMA only once
+     * per offline transition; DaemonTask invokes this callback every tick
+     * after the timeout, and restarting it every tick can prevent a frame
+     * from being received successfully.
+     */
+    if (!rc_recovery_started) {
+        rc_recovery_started = 1u;
+        USARTServiceInit(rc_usart_instance);
+        LOGWARNING("[rc] remote control lost");
+    }
 }
 
 RC_ctrl_t *RemoteControlInit(UART_HandleTypeDef *rc_usart_handle)
@@ -295,4 +314,9 @@ uint8_t RemoteControlIsOnline()
     if (rc_init_flag)
         return DaemonIsOnline(rc_daemon_instance);
     return 0;
+}
+
+uint32_t RemoteControlGetUpdateCount(void)
+{
+    return rc_update_count;
 }
